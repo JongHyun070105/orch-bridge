@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec "$HOME/.local/share/orchbridge/venv/bin/python" "$HOME/.local/share/orchbridge/app/ai_workspace.py" "$@"

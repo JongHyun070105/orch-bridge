@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$HOME/.local/share/orchbridge/venv/bin/python" "$HOME/.local/share/orchbridge/app/ai_quota_probe.py" "$@"

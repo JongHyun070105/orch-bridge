@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BASE="$HOME/.local/share/orchbridge"
+PY="$BASE/venv/bin/python"
+[[ -x "$PY" ]] || PY="$(command -v python3)"
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  help|-h|--help)
+    cat <<'EOF'
+OrchBridge
+
+Usage:
+  orch tui [project]               Open/register a project TUI
+  orch run <task...>               Run one orchestrated task headlessly
+  orch project <subcommand...>     Project/tmux workspace management
+  orch settings [subcommand...]    Provider/model settings
+  orch notify [test|send ...]      Desktop notification helper
+  orch quota                       Provider quota summary
+  orch doctor                      Environment/provider diagnostics
+  orch version                     Print installed version
+  orch uninstall [--purge-state]   Remove OrchBridge (preserves state by default)
+EOF
+    ;;
+  tui)
+    target="${1:-$PWD}"
+    exec "$HOME/.local/bin/orch-project" open "$target"
+    ;;
+  run)
+    exec "$PY" "$BASE/app/ai_orch.py" "$@"
+    ;;
+  project)
+    exec "$PY" "$BASE/app/ai_workspace.py" "$@"
+    ;;
+  settings|setting|config)
+    exec "$PY" "$BASE/app/settings_cli.py" "$@"
+    ;;
+  notify)
+    exec "$PY" "$BASE/app/desktop_notify.py" "$@"
+    ;;
+  quota)
+    exec "$HOME/.local/bin/ai-quota" "$@"
+    ;;
+  doctor)
+    echo "OrchBridge doctor"
+    echo "-----------------"
+    echo "python: $($PY --version 2>&1)"
+    echo "tmux:   $(command -v tmux || echo missing)"
+    echo "git:    $(command -v git || echo missing)"
+    "$PY" "$BASE/app/settings_cli.py" detect
+    ;;
+  version)
+    "$PY" - <<'PY'
+import json
+from pathlib import Path
+p=Path.home()/'.local/share/orchbridge/VERSION.json'
+try: print(json.loads(p.read_text()).get('release','unknown'))
+except Exception: print('unknown')
+PY
+    ;;
+  uninstall)
+    helper="$BASE/uninstall.sh"
+    [[ -x "$helper" ]] || { echo "OrchBridge uninstall helper is missing: $helper" >&2; exit 2; }
+    exec "$helper" "$@"
+    ;;
+  *)
+    echo "unknown command: $cmd" >&2
+    exec "$0" help
+    ;;
+esac

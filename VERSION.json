@@ -1,0 +1,13 @@
+{
+  "release": "1.0.0",
+  "product": "OrchBridge",
+  "state_schema": 2,
+  "config_schema": 1,
+  "router_learning_schema": 1,
+  "queue_schema": 1,
+  "branch_workflow_schema": 1,
+  "permission_profile_schema": 1,
+  "quota_cache_schema": 2,
+  "release_name": "Public Open Source Edition",
+  "platforms": ["macOS", "Linux"]
+}

@@ -1,0 +1,77 @@
+name: Release Assets
+
+on:
+  release:
+    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: Exact semantic version tag to build
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vMAJOR.MINOR.PATCH tag
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  assets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve exact release tag
+        id: release-tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          TAG="${INPUT_TAG:-$EVENT_TAG}"
+          [[ -n "$TAG" ]] || { echo "release tag is required" >&2; exit 2; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release-tag.outputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install release test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check -r requirements.txt pytest
+      - name: Validate tag and source version
+        run: python scripts/validate_release.py "${{ steps.release-tag.outputs.tag }}"
+      - name: Release-critical tests
+        run: |
+          python -m compileall -q app scripts tests
+          pytest -q
+          bash -n install.sh uninstall.sh scripts/*.sh
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          for path in Path("bin").iterdir():
+              if path.is_file() and path.open(encoding="utf-8").readline().strip() in {
+                  "#!/usr/bin/env bash", "#!/bin/bash", "#!/usr/bin/bash"
+              }:
+                  subprocess.run(["bash", "-n", str(path)], check=True)
+          PY
+      - name: Build checksummed release artifacts
+        run: python scripts/build_release.py
+      - name: Create release if the tag workflow was dispatched directly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release-tag.outputs.tag }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --title "OrchBridge $RELEASE_TAG" \
+              --generate-notes
+          fi
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release-tag.outputs.tag }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber

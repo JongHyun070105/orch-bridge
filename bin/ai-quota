@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import json,subprocess
+from pathlib import Path
+HOME=Path.home(); H=HOME/'.local/bin/ai-model-quota'
+def get(t):
+    try:
+        p=subprocess.run([str(H),t,'--json'],capture_output=True,text=True,timeout=30)
+        for s in reversed([x for x in p.stdout.splitlines() if x.strip()]):
+            try:
+                x=json.loads(s)
+                if isinstance(x,dict):return x
+            except Exception:pass
+        return {'summary':'quota unavailable','reason':p.stderr.strip() or 'no JSON'}
+    except Exception as e:return {'summary':'quota unavailable','reason':str(e)}
+def show(title,target):
+    d=get(target); print(title); print('  '+str(d.get('summary') or 'quota unavailable'))
+    if d.get('reason') and 'unavailable' in str(d.get('summary','')): print('  reason   '+str(d['reason']))
+print('Quota / reset'); print('-------------'); show('Codex','codex'); show('AGY Claude/GPT','sonnet'); show('AGY Gemini','gemini-medium'); show('Command Code','cmd'); show('Claude native subscription','claude-sonnet')

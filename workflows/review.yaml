@@ -1,0 +1,17 @@
+name: review
+version: 1
+execution: reference-only
+description: Read-only cross-check focused on correctness, regressions, and missing tests.
+intent:
+  main_model: auto
+  delegate_count: 3
+  prefer_vendor_diversity: true
+  parallel_reviews: read-only
+  mechanical_tests: true
+phases:
+  - inspect-diff
+  - run-targeted-checks
+  - independent-review
+  - report
+safety:
+  write_mode: false

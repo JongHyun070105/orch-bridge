@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse,json,subprocess,time
+from pathlib import Path
+from typing import Any
+HOME=Path.home(); BIN=HOME/".local/bin"; CACHE=HOME/".cache/orchbridge"
+LABELS={"codex":"GPT-6 Luna","cmd":"MiMo V2.5 Pro","sonnet":"AGY Claude Sonnet","opus":"AGY Claude Opus","gemini-low":"Gemini 3.8 Flash low","gemini-medium":"Gemini 3.8 Flash medium","gemini-high":"Gemini 3.8 Flash high","claude-sonnet":"Claude Code Sonnet","claude-opus":"Claude Code Opus"}
+def load(p:Path)->dict[str,Any]:
+    try:x=json.loads(p.read_text()); return x if isinstance(x,dict) else {}
+    except Exception:return {}
+def age(d:dict[str,Any],p:Path)->float|None:
+    for k in ('captured_at','_quota_captured_at_unix','_captured_at_unix'):
+        try:return max(0,time.time()-float(d[k]))
+        except Exception:pass
+    try:return max(0,time.time()-p.stat().st_mtime)
+    except Exception:return None
+def fmtreset(epoch:Any)->str|None:
+    try:s=max(0,int(float(epoch)-time.time()))
+    except Exception:return None
+    d,s=divmod(s,86400); h,s=divmod(s,3600); m,_=divmod(s,60)
+    return f"{d}d {h}h" if d else (f"{h}h {m}m" if h else f"{m}m")
+def live(provider:str)->dict[str,Any]:
+    try:
+        p=subprocess.run([str(BIN/'ai-quota-probe'),provider,'--json'],capture_output=True,text=True,timeout=25)
+        for line in reversed([x for x in p.stdout.splitlines() if x.strip()]):
+            try:
+                x=json.loads(line)
+                if isinstance(x,dict):return x
+            except Exception:pass
+        return {'ok':False,'reason':p.stderr.strip() or 'quota probe returned no JSON'}
+    except Exception as e:return {'ok':False,'reason':str(e)}
+def snapshot(target:str,refresh:bool)->dict[str,Any]:
+    if target in {'codex','cmd'}:
+        d=live(target) if refresh else load(CACHE/('codex-usage.json' if target=='codex' else 'cmd-usage.json'))
+        p=CACHE/('codex-usage.json' if target=='codex' else 'cmd-usage.json')
+        vals=[]; parts=[]
+        keys=[('monthly_remaining_pct','month')] if target=='cmd' else []
+        keys += [('five_hour_remaining_pct','5h'),('weekly_remaining_pct','wk')]
+        for k,label in keys:
+            if d.get(k) is not None:
+                try:v=float(d[k]); vals.append(v); parts.append(f"{label} {v:.0f}%")
+                except Exception:pass
+        return {'target':target,'label':LABELS[target],'source':str(p),'fresh':bool(d.get('fresh')),'age_seconds':age(d,p),'remaining_pct':min(vals) if vals else None,'summary':' · '.join(parts) if parts else 'quota unavailable','raw':d,'reason':d.get('reason')}
+    if target.startswith('claude-'):
+        p=CACHE/'claude-usage.json'; d=load(p); vals=[]; parts=[]
+        for k,label in [('five_hour_remaining_pct','5h'),('seven_day_remaining_pct','7d')]:
+            if d.get(k) is not None:
+                v=float(d[k]); vals.append(v); reset=fmtreset(d.get(k.replace('remaining_pct','reset_at'))); parts.append(f"{label} {v:.0f}%"+(f" · reset {reset}" if reset else ''))
+        return {'target':target,'label':LABELS[target],'source':str(p),'fresh':False,'age_seconds':age(d,p),'remaining_pct':min(vals) if vals else None,'summary':' · '.join(parts) if parts else 'quota unavailable · run Claude once to capture subscription windows','raw':d,'reason':None if parts else 'no native Claude rate_limit_event cache yet'}
+    p=CACHE/'agy-status.json'; d=load(p); q=d.get('quota',{}) if isinstance(d,dict) else {}; keys=('gemini-5h','gemini-weekly') if target.startswith('gemini-') else ('3p-5h','3p-weekly'); vals=[]; parts=[]
+    for key,label in zip(keys,('5h','wk')):
+        item=q.get(key,{}) if isinstance(q,dict) else {}; frac=item.get('remaining_fraction') if isinstance(item,dict) else None
+        if frac is not None:
+            v=float(frac)*100; vals.append(v); parts.append(f"{label} {v:.0f}%")
+    a=age(d,p); summary=' · '.join(parts) if parts else 'quota unavailable'; summary += f" · cached {int(a)}s" if a is not None else ''
+    return {'target':target,'label':LABELS[target],'source':str(p),'fresh':False,'age_seconds':a,'remaining_pct':min(vals) if vals else None,'summary':summary,'raw':{k:q.get(k) for k in keys}}
+def main()->int:
+    ap=argparse.ArgumentParser(); ap.add_argument('target',choices=sorted(LABELS)); ap.add_argument('--no-refresh',action='store_true'); ap.add_argument('--json',action='store_true'); ns=ap.parse_args(); d=snapshot(ns.target,not ns.no_refresh); print(json.dumps(d,ensure_ascii=False) if ns.json else f"{d['label']}: {d['summary']}"); return 0
+if __name__=='__main__':raise SystemExit(main())

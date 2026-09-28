@@ -1,0 +1,45 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      - name: Run CI for the Release Please pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr_number="$(gh pr list --repo JongHyun070105/orch-bridge --base main --state open \
+            --json number,headRefName \
+            --jq '.[] | select(.headRefName == "release-please--branches--main") | .number' | head -n 1)"
+          if [[ -z "$pr_number" ]]; then
+            echo "No open Release Please pull request to validate."
+          else
+            gh api repos/JongHyun070105/orch-bridge/dispatches \
+              -f event_type=release-please-pr \
+              -f "client_payload[ref]=refs/pull/${pr_number}/head"
+          fi
+
+  release-assets:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-assets.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
