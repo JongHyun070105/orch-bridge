@@ -1,2 +1,2 @@
-textual>=0.86,<7
+textual>=8.2.8,<9
 prompt_toolkit>=3.0.43,<4
