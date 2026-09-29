@@ -1,5 +1,7 @@
 # OrchBridge
 
+**English** | [한국어](README.ko.md)
+
 Local multi-provider coding-agent orchestrator with adaptive routing, safe delegation, persistent queues, Git workflows, and a cross-platform TUI.
 
 [![CI](https://github.com/JongHyun070105/orch-bridge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/JongHyun070105/orch-bridge/actions/workflows/ci.yml)
@@ -10,13 +12,13 @@ Local multi-provider coding-agent orchestrator with adaptive routing, safe deleg
 
 OrchBridge runs multiple AI coding CLIs behind one TUI and one routing layer. It can choose a MAIN agent, delegate independent checks, preserve project-scoped state, queue follow-up work, manage safe Git branches, show quota/health information, and notify you when long-running work finishes.
 
-> **v1.0.0** — first public release. Supports macOS and Linux.
+> **v1.1.0** — current public release. Adds persistent same-job steering and advanced provider diagnostics while supporting macOS and Linux.
 
 ## Quick start
 
 ```bash
-curl -fLO https://github.com/JongHyun070105/orch-bridge/releases/download/v1.0.0/orchbridge-v1.0.0.sh
-bash orchbridge-v1.0.0.sh
+curl -fLO https://github.com/JongHyun070105/orch-bridge/releases/download/v1.1.0/orchbridge-v1.1.0.sh
+bash orchbridge-v1.1.0.sh
 orch doctor
 orch settings detect
 cd ~/Projects/my-project
@@ -57,7 +59,7 @@ Most coding-agent CLIs are excellent on their own, but real work often needs mor
 | macOS | Supported | `terminal-notifier` or built-in `osascript` | `pbcopy` |
 | Linux | Supported | `notify-send` | `wl-copy`, `xclip`, or `xsel` |
 
-Windows is not supported in v1.0. WSL2 may work as a Linux environment but is not part of the v1.0 support contract.
+Windows is not supported in v1.1. WSL2 may work as a Linux environment but is not part of the v1.1 support contract.
 
 ## Requirements
 
@@ -82,16 +84,16 @@ OrchBridge does **not** install or store credentials for these providers. Each p
 
 ### Release asset
 
-Download `orchbridge-v1.0.0.sh` from the [v1.0.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.0.0), or fetch it directly:
+Download `orchbridge-v1.1.0.sh` from the [v1.1.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.1.0), or fetch it directly:
 
 ```bash
-bash orchbridge-v1.0.0.sh
+bash orchbridge-v1.1.0.sh
 ```
 
 If Git/tmux/Python support is missing and you want the installer to use Homebrew, apt, dnf, or pacman:
 
 ```bash
-bash orchbridge-v1.0.0.sh --install-system-deps
+bash orchbridge-v1.1.0.sh --install-system-deps
 ```
 
 ### Development checkout
@@ -209,7 +211,7 @@ Common commands include:
 
 Press `Ctrl+P`, select with arrow keys, and press `Enter`.
 
-v1.0 explicitly disables OrchBridge's priority composer bindings while Textual's `CommandPalette` screen is active, so `Enter` reaches the selected palette command instead of being stolen by the composer.
+v1.1 keeps OrchBridge's priority composer bindings disabled while Textual's `CommandPalette` screen is active, so `Enter` reaches the selected palette command instead of being stolen by the composer.
 
 ## Permissions
 
@@ -330,7 +332,7 @@ The YAML files are examples/specifications, not executable workflow plans in v1.
 
 ## Limitations
 
-- Windows is not officially supported in v1.0.0.
+- Windows is not officially supported in v1.1.0.
 - Provider capabilities and authentication depend on upstream CLIs, subscriptions, and local setup.
 - Quota information is best-effort and can be unavailable or stale.
 - Workflow YAML files are reference examples; a declarative workflow execution engine is not included.
