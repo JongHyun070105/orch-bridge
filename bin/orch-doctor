@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BASE="${ORCHBRIDGE_HOME:-$HOME/.local/share/orchbridge}"
+PY="$BASE/venv/bin/python"
+[[ -x "$PY" ]] || PY="$(command -v python3)"
+exec "$PY" "$BASE/app/provider_doctor.py" "$@"

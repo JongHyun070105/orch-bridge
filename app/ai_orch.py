@@ -19,6 +19,7 @@ from orch_quality import (
     router_learning_adjustment,
     task_tags,
 )
+from provider_runtime import effective_provider_enabled, resolve_provider_cli
 
 
 def _quiet_keyboard_interrupt_excepthook(exc_type, exc, tb):
@@ -124,8 +125,8 @@ def claude_subscription_env(extra: dict[str, str] | None = None) -> dict[str, st
     return env
 
 def claude_subscription_ready() -> tuple[bool, str | None]:
-    if not shutil.which("claude"):
-        return False, "Claude Code CLI not installed"
+    if not resolve_provider_cli("claude", config):
+        return False, "Claude Code CLI not installed or not executable"
     issue = claude_subscription_settings_issue(repo)
     if issue:
         return False, issue
@@ -362,8 +363,12 @@ risk: consequences of a wrong answer/action.
 crosscheck: value of an independent second model.
 write_likelihood: likelihood the task requires modifying files.
 """
+    judge_exe = resolve_provider_cli("commandcode", config)
+    if not judge_exe:
+        log("decision micro-judge unavailable: Command Code executable not found")
+        return None
     cmd = [
-        "cmd", "-p", prompt,
+        judge_exe, "-p", prompt,
         "--plan", "--skip-onboarding",
         "--output-format", "json",
         "--max-turns", "1",
@@ -475,18 +480,9 @@ providers_cfg = config.get("providers", {}) if isinstance(config.get("providers"
 PROVIDER_BINARIES = {"codex": "codex", "claude": "claude", "agy": "agy", "commandcode": "cmd"}
 
 def provider_enabled(backend: str) -> bool:
-    item = providers_cfg.get(backend, {})
-    if isinstance(item, bool):
-        if not item:
-            return False
-        item = {}
-    if not isinstance(item, dict):
-        item = {}
-    configured = item.get("enabled", "auto")
-    if configured is False or str(configured).lower() in {"false", "off", "0", "disabled"}:
-        return False
-    binary = str(item.get("binary") or PROVIDER_BINARIES.get(backend, backend))
-    return shutil.which(binary) is not None
+    # Keep public provider on/off/auto semantics, but resolve CLIs through PATH,
+    # common runtime locations, NVM bins, and login/interactive shell PATH.
+    return effective_provider_enabled(config, backend)
 
 last = state.get("last_success") if isinstance(state.get("last_success"), dict) else {}
 
@@ -735,6 +731,15 @@ class Outcome:
     detail: str = ""
     task_status: str | None = None
 
+
+def _missing_cli_outcome(name: str) -> Outcome:
+    return Outcome(
+        False,
+        "",
+        "missing_binary",
+        f"{name} executable not found via configured binary, override, PATH, common runtime paths, or login/interactive shell PATH",
+    )
+
 def run_with_heartbeat(argv: list[str], timeout: int = 1800) -> subprocess.CompletedProcess[str]:
     start = time.monotonic()
     proc = subprocess.Popen(
@@ -940,8 +945,11 @@ STRICT CURRENT-TASK MODE:
 def run_codex(prompt: str) -> Outcome:
     label = "Codex"
     prompt = _phase1_wrap_prompt(prompt, "codex")
+    exe = resolve_provider_cli("codex", config)
+    if not exe:
+        return _missing_cli_outcome("codex")
     argv = [
-        "codex", "exec",
+        exe, "exec",
         "--json",
         "--dangerously-bypass-approvals-and-sandbox",
         "-",
@@ -1040,8 +1048,11 @@ def run_agy(prompt: str, model: str) -> Outcome:
     label = _model_progress_label(model, "agy")
     caller = _phase1_agy_caller(model)
     prompt = _phase1_wrap_prompt(prompt, caller)
+    exe = resolve_provider_cli("agy", config)
+    if not exe:
+        return _missing_cli_outcome("agy")
     argv = [
-        "agy", "-p", prompt,
+        exe, "-p", prompt,
         "--model", model,
         "--output-format", "stream-json",
         "--dangerously-skip-permissions",
@@ -1182,8 +1193,11 @@ def run_claude(prompt: str, model: str) -> Outcome:
     issue = claude_subscription_settings_issue(repo)
     if issue:
         return Outcome(False, "", "auth", issue)
+    exe = resolve_provider_cli("claude", config)
+    if not exe:
+        return _missing_cli_outcome("claude")
     argv = [
-        "claude", "-p",
+        exe, "-p",
         "--model", model,
         "--output-format", "stream-json",
         "--verbose",
@@ -1256,8 +1270,11 @@ def run_claude(prompt: str, model: str) -> Outcome:
 def run_cmd(prompt: str, model: str, effort: str = "medium") -> Outcome:
     label = "CMD"
     prompt = _phase1_wrap_prompt(prompt, "cmd")
+    exe = resolve_provider_cli("commandcode", config)
+    if not exe:
+        return _missing_cli_outcome("commandcode")
     argv = [
-        "cmd", "-p", prompt,
+        exe, "-p", prompt,
         "--skip-onboarding",
         "--yolo",
         "--output-format", "json",
@@ -1508,6 +1525,12 @@ def invoke_candidate(c: Candidate, prompt: str) -> Outcome:
 def handle_failure(c: Candidate, outcome: Outcome) -> bool:
     """Return True if remaining candidates of the same AGY backend should be skipped."""
     detail = outcome.detail
+    if outcome.kind == "missing_binary":
+        # Missing/broken local executables are environment problems, not provider
+        # service failures. Do not poison router health with a long cooldown.
+        log(f"{c.backend} unavailable: CLI executable unavailable (no cooldown; run /doctor)")
+        return c.backend == "agy"
+
     if c.backend == "codex":
         if outcome.kind == "rate_limit":
             block_with_backoff("codex", "rate/quota limit", 900)

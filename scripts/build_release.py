@@ -11,6 +11,7 @@ import json
 import shutil
 import stat
 import tarfile
+import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
@@ -76,6 +77,22 @@ def _write_deterministic_tar(root: Path, files: Iterable[Path]) -> bytes:
                 info.mode = 0o755 if path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH) else 0o644
                 archive.addfile(info, io.BytesIO(data))
     return tar_bytes.getvalue()
+
+
+def _write_deterministic_zip(root: Path, files: Iterable[Path]) -> bytes:
+    version = json.loads((root / "VERSION.json").read_text(encoding="utf-8"))["release"]
+    name = f"orchbridge-v{version}"
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for path in files:
+            relative = path.relative_to(root).as_posix()
+            info = zipfile.ZipInfo(f"{name}/{relative}", date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            mode = 0o755 if path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH) else 0o644
+            info.external_attr = (stat.S_IFREG | mode) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+    return output.getvalue()
 
 
 def _standalone_installer(name: str, archive_sha256: str, raw_archive: bytes) -> str:
@@ -144,7 +161,7 @@ __ORCHBRIDGE_PAYLOAD_SHELL__
 '''
 
 
-def build_release(root: Path = ROOT, dist_dir: Path | None = None) -> tuple[Path, Path, Path]:
+def build_release(root: Path = ROOT, dist_dir: Path | None = None) -> tuple[Path, Path, Path, Path]:
     root = root.resolve()
     version = str(json.loads((root / "VERSION.json").read_text(encoding="utf-8"))["release"])
     name = f"orchbridge-v{version}"
@@ -155,6 +172,10 @@ def build_release(root: Path = ROOT, dist_dir: Path | None = None) -> tuple[Path
     archive_path = dist / f"{name}.tar.gz"
     archive_path.write_bytes(raw_archive)
 
+    raw_zip = _write_deterministic_zip(root, release_files(root))
+    zip_path = dist / f"{name}.zip"
+    zip_path.write_bytes(raw_zip)
+
     archive_sha256 = hashlib.sha256(raw_archive).hexdigest()
     installer_path = dist / f"{name}.sh"
     installer_path.write_text(_standalone_installer(name, archive_sha256, raw_archive), encoding="utf-8")
@@ -163,10 +184,10 @@ def build_release(root: Path = ROOT, dist_dir: Path | None = None) -> tuple[Path
     checksum_path = dist / "SHA256SUMS.txt"
     checksums = [
         f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}"
-        for path in (installer_path, archive_path)
+        for path in (installer_path, archive_path, zip_path)
     ]
     checksum_path.write_text("\n".join(checksums) + "\n", encoding="utf-8")
-    return installer_path, archive_path, checksum_path
+    return installer_path, archive_path, zip_path, checksum_path
 
 
 def main() -> int:

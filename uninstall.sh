@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="$HOME/.local/share/orchbridge"
+BASE="${ORCHBRIDGE_HOME:-$HOME/.local/share/orchbridge}"
 BIN="$HOME/.local/bin"
 PURGE_STATE=0
 YES=0
@@ -15,7 +15,7 @@ for arg in "$@"; do
 Usage: uninstall.sh [--purge-state] [--yes]
 
 By default this removes the OrchBridge runtime and commands while preserving
-project queues, job history, and other persistent state under the state folder.
+project queues, job history, backups, and other persistent state under the state folder.
 Use --purge-state to remove that data too. --yes confirms the state purge.
 EOF
       exit 0
@@ -43,7 +43,7 @@ rm -f "$BASE/VERSION.json" "$BASE/uninstall.sh"
 for name in \
   ai-chat-tui ai-model-quota ai-orch ai-orch-dashboard ai-orch-update \
   ai-quota ai-quota-probe cmd-usage-snapshot codex-usage-snapshot \
-  orch orch-attachments orch-branch orch-collab orch-collect orch-consult \
+  orch orch-doctor orch-attachments orch-branch orch-collab orch-collect orch-consult \
   orch-context orch-delegate orch-delegate-recover orch-delegations \
   orch-facts orch-handoff orch-health orch-mcp orch-notify orch-parallel \
   orch-project orch-settings orch-skills orch-tools orchbridge; do
