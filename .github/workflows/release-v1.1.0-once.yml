@@ -1,0 +1,39 @@
+name: Release v1.1.0 Once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-v1.1.0-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: v1.1.0
+      RELEASE_SHA: 5901a1e7b85942ce46eaa34863d9446c91a5b0df
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate release metadata
+        run: python scripts/validate_release.py "$TAG"
+      - name: Build deterministic release artifacts
+        run: python scripts/build_release.py
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$RELEASE_SHA" \
+              --title "OrchBridge $TAG" \
+              --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --clobber
