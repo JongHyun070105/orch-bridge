@@ -231,6 +231,8 @@ SLASH_COMMANDS = [
     ("/notify important", "BLOCKED/NEEDS_USER 같은 확인 필요 상태만 알림"),
     ("/notify off", "데스크탑 알림 끄기"),
     ("/notify test", "데스크탑 알림 테스트 (macOS/Linux)"),
+    ("/doctor", "모델 CLI / PATH / npm 상태 진단"),
+    ("/steer <지시>", "현재 작업의 방향을 수정하고 같은 job으로 이어서 실행"),
     ("/new", "새 TUI 세션 시작"),
     ("/queue", "현재 프로젝트의 다음 작업 대기열 보기"),
     ("/queue add <prompt>", "다음 작업을 대기열 끝에 추가"),
@@ -328,6 +330,14 @@ def append_jsonl(path: Path, data: dict[str, Any]) -> None:
 
 def clean(line: str) -> str:
     return ANSI_RE.sub("", line).rstrip("\r\n")
+
+
+def _validated_task_status(status: str | None, rc: int) -> str | None:
+    """Never accept COMPLETE from a failed ai-orch process."""
+    normalized = str(status or "").strip().upper() or None
+    if rc != 0 and normalized == "COMPLETE":
+        return None
+    return normalized
 
 
 def _pretty_slug(slug: str) -> str:
@@ -2736,6 +2746,25 @@ class OrchBridgeApp(App):
             effective_original += "\n\n--- ORCHESTRATOR TASK CONTEXT ---\n" + context
         if repo_facts:
             effective_original += "\n\n--- FRESH REPO FACTS ---\n" + repo_facts
+        steer_path = self.job_dir / "steer-history.jsonl"
+        if steer_path.exists():
+            rows: list[str] = []
+            for line in steer_path.read_text().splitlines()[-20:]:
+                try:
+                    item = json.loads(line)
+                    instruction = str(item.get("instruction") or "").strip()
+                    if instruction:
+                        rows.append(f"- {instruction}")
+                except Exception:
+                    continue
+            if rows:
+                effective_original += (
+                    "\n\n--- STEERING INSTRUCTIONS ---\n"
+                    "These are authoritative updates to the SAME task. "
+                    "The latest instruction overrides earlier conflicting guidance, "
+                    "but all original safety/governance gates remain in force.\n"
+                    + "\n".join(rows)
+                )
         if not resume:
             return effective_original, original
 
@@ -3034,9 +3063,16 @@ RESUME RULES:
                 self.note(f"Result read error: {e}", title="ERROR")
 
         response = str(result.get("response") or "")
-        status = str(result.get("task_status") or self.task_status or "").upper() or None
+        reported_status = str(result.get("task_status") or self.task_status or "").upper() or None
         rc = int(result.get("rc", msg.rc))
+        status = _validated_task_status(reported_status, rc)
         combined = "\n".join(self.raw[-1200:]) + "\n" + str(result.get("stderr_text") or "")
+        if rc != 0 and reported_status == "COMPLETE":
+            self.note(
+                f"Ignoring reported COMPLETE because ai-orch exited with rc={rc}.",
+                title="RUNTIME FAILURE",
+                collapsed=False,
+            )
         self.proc = None
         self._mark_main_worker_finished(rc)
         self._recovered_main_result_posted = False
@@ -3060,9 +3096,16 @@ RESUME RULES:
             # A user pause/cancel is authoritative even if the terminated worker
             # races to produce a final result while SIGTERM is being delivered.
             self.job["status"] = requested_state
+            if requested_state == "PAUSED_USER" and self.job.get("steer_pending"):
+                # A steer intentionally terminates the old MAIN. Resume only after
+                # its late result has been consumed so it cannot overwrite the steer.
+                self.job["steer_pending"] = False
+                self.job["status"] = "PAUSED_RETRY"
+                self.job["resume_at"] = now() + 0.25
             self.save()
             self.update_banner()
-            self._maybe_notify_terminal(requested_state, result, rc)
+            if self.job["status"] == requested_state:
+                self._maybe_notify_terminal(requested_state, result, rc)
             return
 
         if status in {"COMPLETE", "FAILED", "NEEDS_GO", "NEEDS_USER", "BLOCKED"}:
@@ -3213,6 +3256,10 @@ RESUME RULES:
             "QUEUE HALTED",
             "QUEUE PAUSED",
             "QUEUE START",
+            "DOCTOR",
+            "STEER",
+            "STEER WARNING",
+            "RUNTIME FAILURE",
         }
 
         if title in detail_titles:
@@ -3491,6 +3538,8 @@ RESUME RULES:
         self.update_commandbar()
 
     def action_complete_command(self) -> None:
+        if self._command_palette_active():
+            return
         candidates = self._slash_candidates()
         if not candidates:
             return
@@ -3501,6 +3550,8 @@ RESUME RULES:
         self.update_commandbar()
 
     def action_newline(self) -> None:
+        if self._command_palette_active():
+            return
         box = self.query_one("#prompt", TextArea)
         box.insert("\n", maintain_selection_offset=False)
         self.update_commandbar()
@@ -3526,6 +3577,8 @@ RESUME RULES:
         return cleaned, attachments
 
     def action_clear_prompt(self) -> None:
+        if self._command_palette_active():
+            return
         # Reset only the unsent draft: text + pending attachment selections.
         # Persisted job/transcript state and immutable attachment blobs are untouched.
         box = self.query_one("#prompt", TextArea)
@@ -3553,6 +3606,8 @@ RESUME RULES:
             return True
 
     def action_send(self) -> None:
+        if self._command_palette_active():
+            return
         box = self.query_one("#prompt", TextArea)
         text = box.text.strip()
         if not text:
@@ -3742,6 +3797,13 @@ RESUME RULES:
 
         elif cmd in {"/details", "/detail"}:
             self.action_details()
+
+        elif cmd == "/doctor":
+            self.action_doctor()
+
+        elif cmd == "/steer":
+            instruction = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+            self.steer_job(instruction)
 
         elif cmd == "/pause":
             self.action_pause()
@@ -4445,6 +4507,8 @@ RESUME RULES:
             )
 
     def action_copy_last(self) -> None:
+        if self._command_palette_active():
+            return
         self._copy_to_clipboard("last")
 
     def action_details(self) -> None:
@@ -4460,6 +4524,88 @@ RESUME RULES:
         panel = self.attempts[-1].panel
         if panel:
             panel.collapsed = not panel.collapsed
+
+    def action_doctor(self) -> None:
+        try:
+            p = subprocess.run(
+                [str(HOME / ".local/bin/orch-doctor")],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                env=os.environ.copy(),
+            )
+            output = (p.stdout or p.stderr or "doctor returned no output").strip()
+            self.note(output, title="DOCTOR", collapsed=False)
+        except Exception as exc:
+            self.note(
+                f"doctor failed: {type(exc).__name__}: {exc}",
+                title="ERROR",
+                collapsed=False,
+            )
+
+    def steer_job(self, instruction: str) -> None:
+        instruction = instruction.strip()
+        if not instruction:
+            self.note("사용법: /steer <현재 작업에 반영할 지시>", title="도움말", collapsed=False)
+            return
+        if not self.job or not self.job_dir:
+            self.note("현재 조정할 작업이 없습니다.", title="STEER", collapsed=False)
+            return
+        status = str(self.job.get("status") or "")
+        if status in {"COMPLETE", "FAILED", "NEEDS_GO", "NEEDS_USER", "BLOCKED", "CANCELLED"}:
+            self.note(f"현재 작업은 {status} 상태라 steer할 수 없습니다.", title="STEER", collapsed=False)
+            return
+
+        local_running = bool(self.proc is not None and self.proc.poll() is None)
+        recovered_running = bool(self._live_main_worker())
+        was_running = local_running or recovered_running
+        self.checkpoint()
+        append_jsonl(
+            self.job_dir / "steer-history.jsonl",
+            {
+                "ts": iso(),
+                "instruction": instruction,
+                "from_status": status,
+                "sequence": int(self.job.get("steer_count", 0)) + 1,
+                "source": "tui",
+            },
+        )
+        self.job["steer_count"] = int(self.job.get("steer_count", 0)) + 1
+        self.job["last_steer"] = instruction
+        self.job["last_steer_at"] = iso()
+        self.event("status", f"STEER: {instruction}")
+
+        if was_running:
+            self.job["status"] = "PAUSED_USER"
+            self.job["resume_at"] = None
+            self.job["steer_pending"] = True
+            self.save()
+            ok, detail = self._terminate_main_worker()
+            if not ok:
+                self.note(
+                    "Steer 지시는 저장했지만 현재 MAIN을 안전하게 중단하지 못했습니다.\n" + detail,
+                    title="STEER WARNING",
+                    collapsed=False,
+                )
+                return
+            if not local_running:
+                self.job["steer_pending"] = False
+                self.job["status"] = "PAUSED_RETRY"
+                self.job["resume_at"] = now() + 5
+                self.save()
+            self.note(
+                f"Steer 적용 · 같은 job으로 안전하게 재개 예정\n{instruction}\n{detail}",
+                title="STEER",
+                collapsed=False,
+            )
+            return
+
+        self.save()
+        self.note(
+            f"Steer 지시를 현재 job에 저장했습니다. 다음 /resume에 반영됩니다.\n{instruction}",
+            title="STEER",
+            collapsed=False,
+        )
 
     def action_pause(self) -> None:
         live = self._live_main_worker()

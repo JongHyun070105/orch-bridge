@@ -8,6 +8,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from provider_runtime import effective_provider_enabled, resolve_provider_cli
+
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config/orchbridge"
 CONFIG_PATH = CONFIG_DIR / "config.json"
@@ -67,14 +69,18 @@ def save(data: dict[str, Any]) -> None:
 
 
 def detect() -> dict[str, Any]:
-    return {
-        name: {
-            "binary": binary,
-            "path": shutil.which(binary),
-            "installed": bool(shutil.which(binary)),
+    data = load()
+    rows: dict[str, Any] = {}
+    for name, binary in PROVIDER_BINARIES.items():
+        item = provider_state(data, name)
+        configured_binary = str(item.get("binary") or binary)
+        path = resolve_provider_cli(name, data, use_cache=False)
+        rows[name] = {
+            "binary": configured_binary,
+            "path": path,
+            "installed": bool(path),
         }
-        for name, binary in PROVIDER_BINARIES.items()
-    }
+    return rows
 
 
 def ensure_config(*, overwrite: bool = False) -> dict[str, Any]:
@@ -95,14 +101,7 @@ def provider_state(data: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def effective_enabled(data: dict[str, Any], name: str) -> bool:
-    item = provider_state(data, name)
-    value = item.get("enabled", "auto")
-    if value is False or str(value).lower() in {"false", "off", "0", "disabled"}:
-        return False
-    binary = str(item.get("binary") or PROVIDER_BINARIES[name])
-    if value is True or str(value).lower() in {"true", "on", "1", "enabled"}:
-        return shutil.which(binary) is not None
-    return shutil.which(binary) is not None
+    return effective_provider_enabled(data, name)
 
 
 def show(data: dict[str, Any], as_json: bool = False) -> None:
@@ -115,9 +114,10 @@ def show(data: dict[str, Any], as_json: bool = False) -> None:
     for name in PROVIDER_BINARIES:
         item = provider_state(data, name)
         binary = str(item.get("binary") or PROVIDER_BINARIES[name])
+        path = resolve_provider_cli(name, data, use_cache=False)
         print(
             f"  {name:<12} configured={item.get('enabled','auto')!s:<5} "
-            f"detected={'yes' if shutil.which(binary) else 'no ':<3} "
+            f"detected={'yes' if path else 'no ':<3} "
             f"effective={'on' if effective_enabled(data,name) else 'off'} "
             f"binary={binary}"
         )

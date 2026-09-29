@@ -9,5 +9,22 @@
   "permission_profile_schema": 1,
   "quota_cache_schema": 2,
   "release_name": "Public Open Source Edition",
-  "platforms": ["macOS", "Linux"]
+  "platforms": [
+    "macOS",
+    "Linux"
+  ],
+  "components": {
+    "ai_chat_tui": "1.1.0",
+    "ai_chat": "1.0.0",
+    "ai_orch": "1.1.0",
+    "ai_workspace": "1.0.0",
+    "desktop_notify": "1.0.0",
+    "settings_cli": "1.1.0",
+    "phase1_supervisor": "1.0.0",
+    "phase3_orchestrator": "1.0.0",
+    "provider_runtime": "1.1.0",
+    "provider_doctor": "1.1.0"
+  },
+  "steering_schema": 1,
+  "provider_health_schema": 1
 }

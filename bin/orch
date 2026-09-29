@@ -41,12 +41,7 @@ EOF
     exec "$HOME/.local/bin/ai-quota" "$@"
     ;;
   doctor)
-    echo "OrchBridge doctor"
-    echo "-----------------"
-    echo "python: $($PY --version 2>&1)"
-    echo "tmux:   $(command -v tmux || echo missing)"
-    echo "git:    $(command -v git || echo missing)"
-    "$PY" "$BASE/app/settings_cli.py" detect
+    exec "$HOME/.local/bin/orch-doctor" "$@"
     ;;
   version)
     "$PY" - <<'PY'

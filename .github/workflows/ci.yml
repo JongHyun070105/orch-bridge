@@ -64,18 +64,26 @@ jobs:
           import hashlib
           import json
           import tarfile
+          import zipfile
           from pathlib import Path
           version = json.loads(Path("VERSION.json").read_text())["release"]
           dist = Path("dist")
           assert (dist / f"orchbridge-v{version}.sh").is_file()
           archive = dist / f"orchbridge-v{version}.tar.gz"
+          zip_archive = dist / f"orchbridge-v{version}.zip"
           assert archive.is_file()
+          assert zip_archive.is_file()
           for row in (dist / "SHA256SUMS.txt").read_text().splitlines():
               digest, name = row.split(maxsplit=1)
               assert hashlib.sha256((dist / name.strip()).read_bytes()).hexdigest() == digest
           with tarfile.open(archive, "r:gz") as bundle:
               names = bundle.getnames()
+          assert f"orchbridge-v{version}/install.sh" in names
           assert not any("/.omx/" in name or "/.venv/" in name for name in names)
+          with zipfile.ZipFile(zip_archive) as bundle:
+              zip_names = bundle.namelist()
+          assert f"orchbridge-v{version}/install.sh" in zip_names
+          assert not any("/.omx/" in name or "/.venv/" in name for name in zip_names)
           PY
 
   linux-install-smoke:

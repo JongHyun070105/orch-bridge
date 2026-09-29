@@ -111,6 +111,7 @@ cp "$HERE/VERSION.json" "$BASE/VERSION.json"
 mkdir -p "$BASE/docs"
 for f in README.md CHANGELOG.md SECURITY.md; do [[ -f "$HERE/$f" ]] && cp "$HERE/$f" "$BASE/docs/$f"; done
 cp "$HERE/uninstall.sh" "$BASE/uninstall.sh"
+chmod +x "$BASE/uninstall.sh"
 
 say "[3/7] Installing CLI commands"
 for src in "$HERE"/bin/*; do
@@ -128,11 +129,12 @@ say "[5/7] Smoke tests"
 "$VPY" -m compileall -q "$BASE/app"
 "$BIN/orch" version | grep -qx "$RELEASE"
 "$BIN/orch" settings detect >/dev/null
+"$BIN/orch" doctor --json >/dev/null
 "$BIN/orch-project" --help >/dev/null
 "$BIN/orch-notify" --help >/dev/null
 
-say "[6/7] Provider discovery"
-"$BIN/orch" settings detect || true
+say "[6/7] Provider doctor (advisory; optional providers never abort install)"
+"$BIN/orch" doctor || true
 
 say "[7/7] Complete"
 cat <<EOF
@@ -144,6 +146,7 @@ Commands:
   orch settings
   orch tui .
   orch run "your task"
+  /steer <instruction>   # inside the TUI while a job is active
 
 State:  $BASE
 Config: $CONFIG_DIR/config.json

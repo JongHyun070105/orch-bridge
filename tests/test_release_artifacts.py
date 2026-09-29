@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tarfile
+import zipfile
 from pathlib import Path
 
 from scripts.build_release import build_release
@@ -30,11 +31,12 @@ def test_release_builder_is_reproducible_and_excludes_local_state(tmp_path: Path
     for left, right in zip(first, second, strict=True):
         assert left.read_bytes() == right.read_bytes()
 
-    installer, archive, checksums = first
+    installer, archive, zip_archive, checksums = first
     version = json.loads((ROOT / "VERSION.json").read_text(encoding="utf-8"))["release"]
     release_root = f"orchbridge-v{version}"
     assert installer.name == f"{release_root}.sh"
     assert archive.name == f"{release_root}.tar.gz"
+    assert zip_archive.name == f"{release_root}.zip"
     assert installer.stat().st_mode & 0o111
 
     with tarfile.open(archive, "r:gz") as source:
@@ -43,6 +45,12 @@ def test_release_builder_is_reproducible_and_excludes_local_state(tmp_path: Path
     assert f"{release_root}/install.sh" in names
     assert not any(name.startswith((f"{release_root}/.omx/", f"{release_root}/.venv/")) for name in names)
     assert not any(".DS_Store" in name or "/__pycache__/" in name for name in names)
+
+    with zipfile.ZipFile(zip_archive) as source:
+        zip_names = source.namelist()
+    assert f"{release_root}/app/ai_chat_tui.py" in zip_names
+    assert f"{release_root}/install.sh" in zip_names
+    assert not any(name.startswith((f"{release_root}/.omx/", f"{release_root}/.venv/")) for name in zip_names)
 
     for line in checksums.read_text(encoding="utf-8").splitlines():
         digest, name = line.split(maxsplit=1)

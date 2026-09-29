@@ -45,6 +45,8 @@ Most coding-agent CLIs are excellent on their own, but real work often needs mor
 - **Crash-safe worker ownership**, leases, recovery, and process-group cancellation
 - **Desktop notifications** on macOS and Linux
 - **Quota/health awareness** with stale-cache fallback rather than fake numbers
+- **Persistent same-job steering** with `/steer <instruction>`, checkpointing, and crash-safe resume
+- **Provider runtime doctor** that resolves PATH/NVM/login-shell installs and diagnoses broken local CLI installs without auto-repair
 - **Textual TUI** with a working `Ctrl+P` command palette
 - **Portable settings CLI**: `orch settings`
 
@@ -72,7 +74,7 @@ Optional AI provider CLIs — install any combination:
 - `agy` — AGY-compatible CLI
 - `cmd` — Command Code
 
-Gemini models are available through the existing AGY provider path. `orch settings detect` checks whether each configured CLI binary is installed. Provider authentication remains with the upstream CLI and is confirmed when that CLI handles a task.
+Gemini models are available through the existing AGY provider path. `orch settings detect` resolves configured binaries through the active PATH plus common user/NVM locations and login-shell PATH. `orch doctor` adds version and broken-install diagnostics. Provider authentication remains with the upstream CLI and is confirmed when that CLI handles a task.
 
 OrchBridge does **not** install or store credentials for these providers. Each provider CLI keeps using its own authentication mechanism.
 
@@ -184,6 +186,8 @@ Common commands include:
 /status
 /quota
 /settings
+/doctor
+/steer <instruction>
 /model auto
 /model claude
 /model codex
@@ -196,6 +200,10 @@ Common commands include:
 /reload
 /version
 ```
+
+### Steering an active task
+
+`/steer <instruction>` updates the **same persisted logical job** instead of creating a new queued task. OrchBridge checkpoints the current job, safely terminates the owned MAIN process, persists steering history in order, and resumes with the original task plus the new steering instructions. A normal prompt entered while a task is running still follows the FIFO queue behavior.
 
 ### Command palette
 
@@ -313,7 +321,8 @@ The YAML files are examples/specifications, not executable workflow plans in v1.
 
 ## Troubleshooting
 
-- **No provider is available:** install and authenticate at least one supported CLI, then run `orch settings detect` and `orch settings show`.
+- **No provider is available:** install and authenticate at least one supported CLI, then run `orch doctor`, `orch settings detect`, and `orch settings show`. Missing local binaries are treated as environment diagnostics and do not trigger a long provider cooldown.
+- **Codex looks partially installed:** `orch doctor` reports broken symlinks, npm package/bin mismatches, and stale `.codex-*` directories. Diagnostics are advisory; OrchBridge never deletes or repairs npm/NVM state automatically.
 - **Linux install reports missing `python3-venv`:** install the package supplied by your distribution (for Debian/Ubuntu, `python3-venv`) and rerun the installer.
 - **Desktop notifications are unavailable:** on Linux install `notify-send` from libnotify and use a desktop session with a notification service. SSH/headless sessions can complete jobs without notifications.
 - **Clipboard integration is unavailable:** install `wl-copy`, `xclip`, or `xsel` on Linux. macOS uses `pbcopy`.
@@ -353,7 +362,7 @@ The repository uses **Conventional Commits** and Release Please:
 - `feat:` → minor candidate
 - `feat!:` / `BREAKING CHANGE:` → major candidate
 
-Pushes to `main` update an automated release PR. Merging that PR creates a Git tag/release, and the release-assets workflow validates the tag, runs release checks, builds the standalone `.sh`, source `.tar.gz`, and checksums, then uploads them to the release. The initial public tag is `v1.0.0`.
+Pushes to `main` update an automated release PR. Merging that PR creates a Git tag/release, and the release-assets workflow validates the tag, runs release checks, builds the standalone `.sh`, source `.tar.gz`, extract-and-run `.zip`, and checksums, then uploads them to the release. The initial public tag is `v1.0.0`.
 
 ## Security and privacy
 
