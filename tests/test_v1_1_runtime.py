@@ -15,7 +15,8 @@ if str(APP) not in sys.path:
 
 def test_v11_metadata_and_public_defaults():
     data = json.loads((ROOT / "VERSION.json").read_text())
-    assert data["release"] in {"1.0.0", "1.1.0"}
+    parts = data["release"].split(".")
+    assert len(parts) == 3 and all(part.isdigit() for part in parts)
     assert data["components"]["provider_runtime"] == "1.1.0"
     assert data["components"]["provider_doctor"] == "1.1.0"
     assert data["platforms"] == ["macOS", "Linux"]

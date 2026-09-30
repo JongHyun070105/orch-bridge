@@ -14,10 +14,10 @@
     "Linux"
   ],
   "components": {
-    "ai_chat_tui": "1.1.0",
+    "ai_chat_tui": "1.2.0",
     "ai_chat": "1.0.0",
     "ai_orch": "1.1.0",
-    "ai_workspace": "1.0.0",
+    "ai_workspace": "1.2.0",
     "desktop_notify": "1.0.0",
     "settings_cli": "1.1.0",
     "phase1_supervisor": "1.0.0",
@@ -26,5 +26,9 @@
     "provider_doctor": "1.1.0"
   },
   "steering_schema": 1,
-  "provider_health_schema": 1
+  "provider_health_schema": 1,
+  "input_safety_schema": 1,
+  "queue_dedupe_schema": 1,
+  "project_registry_delete_schema": 1,
+  "smart_tab_completion_schema": 1
 }

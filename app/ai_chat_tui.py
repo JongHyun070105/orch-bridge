@@ -220,6 +220,7 @@ SLASH_COMMANDS = [
     ("/project root", "새 프로젝트 생성 루트 보기 / 변경"),
     ("/project alias reviewai", "tmux 탭의 짧은 별칭 설정"),
     ("/project close", "현재 프로젝트 창 닫기"),
+    ("/project delete <name>", "등록된 프로젝트를 목록에서 제거 (repo/state 보존)"),
     ("/restart", "현재 프로젝트 TUI를 같은 창에서 즉시 재시작"),
     ("/reload", "프로젝트/TUI 저장 설정을 다시 읽기"),
     ("/version", "현재 로드된 TUI와 설치된 버전 비교"),
@@ -315,6 +316,27 @@ def now() -> float:
 
 def iso(ts: float | None = None) -> str:
     return datetime.fromtimestamp(ts or now()).astimezone().isoformat(timespec="seconds")
+
+
+# Terminal/tmux transport safety. Raw SGR mouse or ANSI reports must never become
+# task text (for example ESC[<43;33;54M or its printable ^[[<... form).
+_ACTUAL_OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
+_ACTUAL_DCS_RE = re.compile(r"\x1b[P^_].*?\x1b\\", re.DOTALL)
+_ACTUAL_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_LITERAL_CSI_RE = re.compile(r"\^\[\[[0-?]*[ -/]*[@-~]")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+SUBMIT_DEDUPE_SECONDS = 12.0
+
+
+def sanitize_terminal_input(text: str) -> tuple[str, bool]:
+    original = str(text or "")
+    cleaned = original.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = _ACTUAL_OSC_RE.sub("", cleaned)
+    cleaned = _ACTUAL_DCS_RE.sub("", cleaned)
+    cleaned = _ACTUAL_CSI_RE.sub("", cleaned)
+    cleaned = _LITERAL_CSI_RE.sub("", cleaned)
+    cleaned = _CONTROL_RE.sub("", cleaned)
+    return cleaned, cleaned != original
 
 
 def atomic_json(path: Path, data: dict[str, Any]) -> None:
@@ -843,6 +865,11 @@ class OrchBridgeApp(App):
         # in legacy-global panes so one repository cannot consume another's work.
         self._queue_notice_key = ""
         self.queue_state = self._load_queue_state()
+
+        # One terminal/key event must not become both a running job and an
+        # identical queued follow-up.
+        self._last_submit_fingerprint = ""
+        self._last_submit_at = 0.0
 
     def _format_age(self, seconds: float) -> str:
         seconds = max(0, int(seconds))
@@ -1488,6 +1515,47 @@ class OrchBridgeApp(App):
             return "INVALID", None
         return str(data.get("status") or "UNKNOWN").upper(), data
 
+    def _submission_fingerprint(self, prompt: str, attachments: list[str]) -> str:
+        payload = {
+            "prompt": str(prompt).strip(),
+            "attachments": sorted({str(x) for x in attachments if str(x)}),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _recent_submit_duplicate(self, prompt: str, attachments: list[str]) -> bool:
+        fp = self._submission_fingerprint(prompt, attachments)
+        return bool(
+            fp
+            and fp == self._last_submit_fingerprint
+            and 0.0 <= now() - self._last_submit_at <= SUBMIT_DEDUPE_SECONDS
+        )
+
+    def _remember_submit(self, prompt: str, attachments: list[str]) -> None:
+        self._last_submit_fingerprint = self._submission_fingerprint(prompt, attachments)
+        self._last_submit_at = now()
+
+    def _recent_queue_duplicate(
+        self, prompt_sha: str, attachments: list[str]
+    ) -> dict[str, Any] | None:
+        wanted_attachments = sorted({str(x) for x in attachments if str(x)})
+        for item in reversed(self.queue_state.get("items", [])):
+            if str(item.get("prompt_sha256") or "") != prompt_sha:
+                continue
+            existing_attachments = sorted(
+                {str(x) for x in item.get("attachments", []) if str(x)}
+            )
+            if existing_attachments != wanted_attachments:
+                continue
+            try:
+                created = datetime.fromisoformat(str(item.get("created_at") or ""))
+                age = now() - created.timestamp()
+            except Exception:
+                continue
+            if 0.0 <= age <= SUBMIT_DEDUPE_SECONDS:
+                return item
+        return None
+
     def _queue_entry_index(self, entry_id: str) -> int | None:
         for i, item in enumerate(self.queue_state.get("items", [])):
             if str(item.get("id") or "") == entry_id:
@@ -1506,11 +1574,22 @@ class OrchBridgeApp(App):
                 "persistent queue requires a registered project workspace; "
                 "reopen with orch-project open <repo>"
             )
+        prompt, contaminated = sanitize_terminal_input(prompt)
+        if contaminated:
+            raise ValueError(
+                "terminal control sequence detected in queued task; re-enter the prompt"
+            )
         prompt = prompt.strip()
         if not prompt and not attachments:
             raise ValueError("queued task is empty")
         if not prompt:
             prompt = "Analyze the attached file(s) and complete the task implied by their contents."
+        prompt_sha = self._prompt_sha(prompt)
+        duplicate = self._recent_queue_duplicate(prompt_sha, attachments)
+        if duplicate is not None:
+            result = dict(duplicate)
+            result["_duplicate_suppressed"] = True
+            return result
         entry_id = (
             "queue-" + datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-")
             + hashlib.sha256((prompt + str(now())).encode("utf-8")).hexdigest()[:8]
@@ -1519,7 +1598,7 @@ class OrchBridgeApp(App):
             "id": entry_id,
             "created_at": iso(),
             "prompt": prompt,
-            "prompt_sha256": self._prompt_sha(prompt),
+            "prompt_sha256": prompt_sha,
             "attachments": list(dict.fromkeys(str(x) for x in attachments if str(x))),
             "runtime": self._current_runtime_state(),
             "branch_plan": self._branch_next_plan(),
@@ -3500,6 +3579,90 @@ RESUME RULES:
         except Exception as e:
             self.note(f"Attach failed: {e}", title="ATTACH ERROR", collapsed=False)
 
+    def _registered_project_completion_names(self) -> list[str]:
+        try:
+            data = json.loads(WORKSPACE_REGISTRY.read_text())
+            rows = data.get("workspaces", {}) if isinstance(data, dict) else {}
+        except Exception:
+            rows = {}
+        values: list[tuple[int, str]] = []
+        for item in rows.values() if isinstance(rows, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("display_name") or item.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                idx = int(item.get("window_index", 9999))
+            except Exception:
+                idx = 9999
+            values.append((idx, name))
+        out: list[str] = []
+        seen: set[str] = set()
+        for _idx, name in sorted(values, key=lambda x: (x[0], x[1].casefold())):
+            key = name.casefold()
+            if key not in seen:
+                seen.add(key)
+                out.append(name)
+        return out
+
+    def _branch_completion_names(self) -> list[str]:
+        try:
+            q = subprocess.run(
+                ["git", "branch", "--format=%(refname:short)"],
+                cwd=self.repo,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if q.returncode != 0:
+                return []
+            return sorted(
+                {x.strip() for x in q.stdout.splitlines() if x.strip()},
+                key=str.casefold,
+            )
+        except Exception:
+            return []
+
+    @staticmethod
+    def _argument_completion_rows(
+        base: str, partial: str, values: list[str], desc: str
+    ) -> list[tuple[str, str]]:
+        if not values:
+            return []
+        p = partial.strip().casefold()
+        exact = any(p == value.casefold() for value in values) if p else False
+        chosen = values if (not p or exact) else [
+            value for value in values if value.casefold().startswith(p)
+        ]
+        return [(f"{base} {value}", desc) for value in chosen]
+
+    def _dynamic_slash_candidates(self, stripped: str) -> list[tuple[str, str]]:
+        m = re.match(
+            r"^/project\s+(open|close|delete|remove|unregister)\s*(.*)$",
+            stripped,
+            re.I,
+        )
+        if m:
+            sub = m.group(1).lower()
+            return self._argument_completion_rows(
+                f"/project {sub}",
+                m.group(2),
+                self._registered_project_completion_names(),
+                "프로젝트 선택",
+            )
+
+        m = re.match(r"^/branch\s+(switch|next)\s*(.*)$", stripped, re.I)
+        if m:
+            sub = m.group(1).lower()
+            return self._argument_completion_rows(
+                f"/branch {sub}",
+                m.group(2),
+                self._branch_completion_names(),
+                "브랜치 선택",
+            )
+        return []
+
     def _slash_candidates(self) -> list[tuple[str, str]]:
         box = self.query_one("#prompt", TextArea)
         text = box.text
@@ -3509,14 +3672,28 @@ RESUME RULES:
         if not stripped.startswith("/"):
             return []
 
+        dynamic = self._dynamic_slash_candidates(stripped)
+        if dynamic:
+            return dynamic
+
         prefix = stripped.lower()
-        # Match against the command token first; /verbose also exposes its modes.
-        return [
+        matches = [
             (cmd, desc)
             for cmd, desc in SLASH_COMMANDS
             if cmd.lower().startswith(prefix)
             or cmd.split()[0].lower().startswith(prefix)
         ]
+        exact = any(cmd.lower() == prefix for cmd, _ in SLASH_COMMANDS)
+        if exact and " " in prefix:
+            root = prefix.split()[0]
+            siblings = [
+                (cmd, desc)
+                for cmd, desc in SLASH_COMMANDS
+                if cmd.lower().startswith(root + " ")
+            ]
+            if siblings:
+                return siblings
+        return matches
 
     def update_commandbar(self) -> None:
         bar = self.query_one("#commandbar", Static)
@@ -3544,7 +3721,16 @@ RESUME RULES:
         if not candidates:
             return
         box = self.query_one("#prompt", TextArea)
-        candidate = candidates[0][0]
+        values = [candidate for candidate, _desc in candidates]
+        current = box.text.strip()
+        exact_idx = next(
+            (i for i, value in enumerate(values) if value.casefold() == current.casefold()),
+            None,
+        )
+        if exact_idx is not None and len(values) > 1:
+            candidate = values[(exact_idx + 1) % len(values)]
+        else:
+            candidate = values[0]
         box.load_text(candidate + (" " if candidate in {"/verbose"} else ""))
         box.cursor_location = box.document.end
         self.update_commandbar()
@@ -3609,7 +3795,20 @@ RESUME RULES:
         if self._command_palette_active():
             return
         box = self.query_one("#prompt", TextArea)
-        text = box.text.strip()
+        raw_text = box.text
+        text, contaminated = sanitize_terminal_input(raw_text)
+        if contaminated:
+            box.load_text(text)
+            box.cursor_location = box.document.end
+            self.update_commandbar()
+            self.note(
+                "터미널 mouse/ANSI 제어 시퀀스가 입력에 섞여 자동 전송을 차단했습니다.\n"
+                "제어문자는 제거했습니다. 내용을 확인한 뒤 Enter를 다시 눌러 보내세요.",
+                title="INPUT SANITIZED",
+                collapsed=False,
+            )
+            return
+        text = text.strip()
         if not text:
             return
 
@@ -3624,12 +3823,23 @@ RESUME RULES:
         if not prompt and not attachments:
             return
 
+        if self._recent_submit_duplicate(prompt, attachments):
+            box.load_text("")
+            self.pending_attachments.clear()
+            self.update_commandbar()
+            self.note(
+                f"같은 프롬프트가 {int(SUBMIT_DEDUPE_SECONDS)}초 안에 다시 submit되어 "
+                "중복 실행/대기열 등록을 차단했습니다.",
+                title="DUPLICATE INPUT BLOCKED",
+                collapsed=False,
+            )
+            return
+
         busy_gate = self._queue_busy_gate()
         queue_has_items = bool(self.queue_state.get("items"))
         if busy_gate or queue_has_items:
             try:
                 entry = self._queue_enqueue(prompt, attachments, gate=busy_gate)
-                self._branch_consume_pending()
             except Exception as e:
                 self.note(
                     f"다음 작업 등록 실패: {e}\n프롬프트는 입력창에 그대로 유지했습니다.",
@@ -3640,6 +3850,16 @@ RESUME RULES:
             box.load_text("")
             self.pending_attachments.clear()
             self.update_commandbar()
+            if entry.get("_duplicate_suppressed"):
+                self.note(
+                    f"동일한 최근 작업이 이미 대기열에 있어 중복 등록을 막았습니다 · "
+                    f"{entry.get('id')}",
+                    title="QUEUE DEDUP",
+                    collapsed=False,
+                )
+                return
+            self._remember_submit(prompt, attachments)
+            self._branch_consume_pending()
             self.note(
                 f"다음 작업으로 등록했습니다 · {entry.get('id')}\n"
                 f"현재 작업이 COMPLETE가 되면 FIFO 순서로 자동 시작합니다.\n"
@@ -3651,6 +3871,7 @@ RESUME RULES:
             return
 
         try:
+            self._branch_apply_plan(self._branch_next_plan())        try:
             self._branch_apply_plan(self._branch_next_plan())
         except Exception as e:
             self.note(f"브랜치 준비 실패: {e}\n프롬프트는 입력창에 그대로 유지했습니다.", title="BRANCH ERROR", collapsed=False)
@@ -3660,6 +3881,7 @@ RESUME RULES:
         self.pending_attachments.clear()
         self.update_commandbar()
         self.new_job(prompt, attachments=attachments)
+        self._remember_submit(prompt, attachments)
 
     def command(self, text: str) -> None:
         p = text.split()
@@ -3736,14 +3958,23 @@ RESUME RULES:
                             attachments,
                             gate=self._queue_busy_gate(),
                         )
-                        self._branch_consume_pending()
                         self.pending_attachments.clear()
-                        self.note(
-                            f"대기열에 추가됨 · {entry.get('id')}",
-                            title="QUEUE",
-                            collapsed=False,
-                        )
-                        self._queue_tick()
+                        if entry.get("_duplicate_suppressed"):
+                            self.note(
+                                f"동일한 최근 작업이 이미 대기열에 있어 중복 등록을 막았습니다 · "
+                                f"{entry.get('id')}",
+                                title="QUEUE DEDUP",
+                                collapsed=False,
+                            )
+                        else:
+                            self._remember_submit(prompt, attachments)
+                            self._branch_consume_pending()
+                            self.note(
+                                f"대기열에 추가됨 · {entry.get('id')}",
+                                title="QUEUE",
+                                collapsed=False,
+                            )
+                            self._queue_tick()
                     except Exception as e:
                         self.note(f"대기열 추가 실패: {e}", title="QUEUE ERROR", collapsed=False)
             elif sub == "remove":
@@ -3916,7 +4147,13 @@ RESUME RULES:
                 title = "PROJECT ALIAS"
             elif len(p) >= 2 and p[1].lower() == "close":
                 argv = [str(helper), "close"]
+                if len(p) >= 3:
+                    argv.append(text.split(None, 2)[2].strip())
                 title = "PROJECT CLOSE"
+            elif len(p) >= 3 and p[1].lower() in {"delete", "remove", "unregister"}:
+                query = text.split(None, 2)[2].strip()
+                argv = [str(helper), "delete", query]
+                title = "PROJECT DELETE"
             else:
                 self.note(
                     "usage:\n"
@@ -3926,7 +4163,8 @@ RESUME RULES:
                     "/project new <name> [--no-git]\n"
                     "/project root [path]\n"
                     "/project alias <short-name|auto>\n"
-                    "/project close",
+                    "/project close [name]\n"
+                    "/project delete <name>   # 목록 등록만 제거; repo/state 보존",
                     title="HELP",
                     collapsed=False,
                 )
