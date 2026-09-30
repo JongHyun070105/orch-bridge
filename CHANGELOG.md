@@ -2,6 +2,13 @@
 
 All notable changes to OrchBridge are documented here.
 
+## [1.2.0](https://github.com/JongHyun070105/orch-bridge/compare/v1.1.0...v1.2.0) (2026-09-30)
+
+
+### Features
+
+* add terminal-safe input and project registry UX ([bc2fb25](https://github.com/JongHyun070105/orch-bridge/commit/bc2fb25dcffdd60a191eb8bab87d1514f64aa836))
+
 ## [1.1.0](https://github.com/JongHyun070105/orch-bridge/compare/v1.0.0...v1.1.0) (2026-09-29)
 
 
