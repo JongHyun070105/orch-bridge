@@ -3871,7 +3871,6 @@ RESUME RULES:
             return
 
         try:
-            self._branch_apply_plan(self._branch_next_plan())        try:
             self._branch_apply_plan(self._branch_next_plan())
         except Exception as e:
             self.note(f"브랜치 준비 실패: {e}\n프롬프트는 입력창에 그대로 유지했습니다.", title="BRANCH ERROR", collapsed=False)

@@ -300,7 +300,6 @@ def resolve_query(query: str) -> dict[str, Any]:
 
 
 def tmux_windows() -> list[dict[str, Any]]:
-def tmux_windows() -> list[dict[str, Any]]:
     if not tmux_has_session():
         return []
     fmt = (
