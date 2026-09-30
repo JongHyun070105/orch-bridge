@@ -12,13 +12,13 @@
 
 OrchBridge는 여러 AI 코딩 CLI를 하나의 TUI와 라우터 뒤에서 조정합니다. MAIN 에이전트를 선택하고, 독립 검증을 다른 모델에 위임하고, 프로젝트별 상태를 보존하며, 후속 작업을 큐에 넣고, 안전한 Git 브랜치 작업과 quota/health 확인, 장시간 작업 완료 알림까지 처리할 수 있습니다.
 
-> **v1.1.0** — 현재 공개 릴리스입니다. 동일 작업을 유지한 채 방향을 바꾸는 영속 `/steer` 기능과 고급 provider 진단 기능이 추가되었으며 macOS와 Linux를 지원합니다.
+> **v1.2.0** — 현재 공개 릴리스입니다. v1.1의 `/steer`/provider 진단에 더해 터미널 입력 안전장치, 중복 작업 차단, 프로젝트 등록 정리와 목록 기반 Tab 자동완성을 추가했습니다.
 
 ## 빠른 시작
 
 ```bash
-curl -fLO https://github.com/JongHyun070105/orch-bridge/releases/download/v1.1.0/orchbridge-v1.1.0.sh
-bash orchbridge-v1.1.0.sh
+curl -fLO https://github.com/JongHyun070105/orch-bridge/releases/download/v1.2.0/orchbridge-v1.2.0.sh
+bash orchbridge-v1.2.0.sh
 orch doctor
 orch settings detect
 cd ~/Projects/my-project
@@ -42,6 +42,8 @@ OrchBridge는 로컬에 설치되고 인증된 provider CLI를 사용하며, 모
 - 실제 수치가 없을 때 임의 값을 만들지 않는 **quota / health 상태 관리**
 - `/steer <instruction>`을 이용한 **동일 작업 영속 steering**
 - PATH / NVM / login shell을 확인하고 로컬 CLI 설치 문제를 진단하는 **provider doctor**
+- 터미널 ANSI/SGR mouse 제어문자 유입을 제거하고 실수로 중복 전송/큐 등록되는 것을 막는 **입력 안전장치**
+- 등록 프로젝트 삭제/번호 재정렬과 프로젝트·브랜치 목록을 이용하는 **스마트 Tab 자동완성**
 - `Ctrl+P` command palette를 지원하는 **Textual TUI**
 - 이식 가능한 설정 CLI: `orch settings`
 
@@ -52,7 +54,7 @@ OrchBridge는 로컬에 설치되고 인증된 provider CLI를 사용하며, 모
 | macOS | 지원 | `terminal-notifier` 또는 내장 `osascript` | `pbcopy` |
 | Linux | 지원 | `notify-send` | `wl-copy`, `xclip`, `xsel` |
 
-Windows는 v1.1에서 공식 지원하지 않습니다. WSL2는 Linux 환경으로 동작할 수 있지만 v1.1 공식 지원 범위에는 포함되지 않습니다.
+Windows는 v1.2에서 공식 지원하지 않습니다. WSL2는 Linux 환경으로 동작할 수 있지만 v1.2 공식 지원 범위에는 포함되지 않습니다.
 
 ## 요구 사항
 
@@ -79,16 +81,16 @@ Gemini 모델은 기존 AGY provider 경로를 통해 사용할 수 있습니다
 
 ### Release asset
 
-[v1.1.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.1.0)에서 `orchbridge-v1.1.0.sh`를 내려받아 실행합니다.
+[v1.2.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.2.0)에서 `orchbridge-v1.2.0.sh`를 내려받아 실행합니다.
 
 ```bash
-bash orchbridge-v1.1.0.sh
+bash orchbridge-v1.2.0.sh
 ```
 
 Git / tmux / Python 관련 시스템 의존성이 없고 Homebrew, apt, dnf 또는 pacman을 통해 설치하도록 허용하려면:
 
 ```bash
-bash orchbridge-v1.1.0.sh --install-system-deps
+bash orchbridge-v1.2.0.sh --install-system-deps
 ```
 
 ### 개발용 체크아웃
@@ -183,6 +185,21 @@ orch settings model gemini_high gemini-3.8-flash-high
 
 탐지 과정에서는 provider 네트워크 호출을 하거나 자격 증명을 읽지 않습니다.
 
+## v1.2 입력 및 프로젝트 UX
+
+터미널/tmux의 ANSI/SGR mouse 제어 시퀀스가 입력창에 섞이면 첫 Enter에서는 작업을 보내지 않습니다. 제어문자만 제거한 프롬프트를 입력창에 남기고, 사용자가 확인한 뒤 다시 Enter를 눌러야 전송됩니다.
+
+동일한 프롬프트와 첨부 조합이 짧은 시간 안에 다시 submit되면 중복 실행/대기열 등록을 차단합니다.
+
+등록 프로젝트는 실제 저장소와 OrchBridge state를 삭제하지 않고 목록에서만 제거할 수 있습니다.
+
+```text
+/project delete <name>
+orch-project delete <name|번호>
+```
+
+삭제 후 프로젝트 번호는 자동으로 당겨집니다. 또한 `/project open|close|delete`는 실제 등록 프로젝트 목록을, `/branch switch|next`는 실제 로컬 브랜치 목록을 이용해 Tab 자동완성합니다.
+
 ## TUI 명령
 
 자주 사용하는 명령:
@@ -219,7 +236,7 @@ OrchBridge는 현재 작업을 checkpoint하고, 소유 중인 MAIN 프로세스
 
 `Ctrl+P`를 누르고 방향키로 항목을 선택한 뒤 `Enter`를 누릅니다.
 
-v1.1에서는 Textual의 `CommandPalette` 화면이 활성화된 동안 OrchBridge composer의 우선 바인딩을 비활성화해 `Enter`가 선택한 palette 명령에 정상 전달됩니다.
+v1.2에서는 Textual의 `CommandPalette` 화면이 활성화된 동안 OrchBridge composer의 우선 바인딩을 비활성화해 `Enter`가 선택한 palette 명령에 정상 전달됩니다.
 
 ## 권한 모드
 
@@ -339,7 +356,7 @@ Cache:         ~/.cache/orchbridge/
 
 ## 제한 사항
 
-- Windows는 v1.1.0에서 공식 지원하지 않습니다.
+- Windows는 v1.2.0에서 공식 지원하지 않습니다.
 - provider 기능과 인증은 각 upstream CLI, 구독, 로컬 환경에 따라 달라집니다.
 - quota 정보는 best-effort이며 사용할 수 없거나 오래된 값일 수 있습니다.
 - workflow YAML은 참고용 예시이며 선언형 workflow 실행 엔진은 포함되지 않습니다.

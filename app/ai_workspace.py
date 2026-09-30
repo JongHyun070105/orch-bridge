@@ -252,14 +252,13 @@ def register(repo_input: str | Path, *, preferred_index: int | None = None) -> d
     return entry
 
 
-def resolve_query(query: str) -> dict[str, Any]:
-    candidate = Path(query).expanduser()
-    if candidate.exists():
-        return register(candidate)
-
+def resolve_registered_query(query: str) -> dict[str, Any]:
+    """Resolve only an already-registered workspace; never register paths as a side effect."""
     data = load_registry()
     rows = list(data["workspaces"].values())
-    q = query.casefold()
+    q = str(query or "").strip().casefold()
+    if not q:
+        raise SystemExit("project query is required")
 
     exact = [
         w for w in rows
@@ -268,6 +267,7 @@ def resolve_query(query: str) -> dict[str, Any]:
             str(w.get("name", "")).casefold(),
             str(w.get("display_name", "")).casefold(),
             str(w.get("repo", "")).casefold(),
+            str(w.get("window_index", "")).casefold(),
         }
     ]
     if len(exact) == 1:
@@ -283,11 +283,20 @@ def resolve_query(query: str) -> dict[str, Any]:
     if len(partial) == 1:
         return partial[0]
     if not partial:
-        raise SystemExit(f"unknown project {query!r}. Use `orch list` or pass a directory path.")
+        raise SystemExit(
+            f"unknown registered project {query!r}. Use 'orch-project list'."
+        )
     raise SystemExit(
         f"ambiguous project {query!r}: "
         + ", ".join(str(x.get("name")) for x in partial[:8])
     )
+
+
+def resolve_query(query: str) -> dict[str, Any]:
+    candidate = Path(query).expanduser()
+    if candidate.exists():
+        return register(candidate)
+    return resolve_registered_query(query)
 
 
 def tmux_windows() -> list[dict[str, Any]]:
@@ -571,6 +580,7 @@ def list_projects(as_json: bool = False) -> int:
         state = "LIVE" if win is not None else "-"
         print(f"{mark}   {win_text:<3}  {state:<5} {str(w.get('name')):<25} {w.get('repo')}")
     print("\nreserved: 0=shell · 9=ops")
+    print("remove stale registration: orch-project delete <project>  (repo/state are preserved)")
     return 0
 
 
@@ -859,6 +869,126 @@ def close_project(query: str | None = None) -> int:
     print(f"closed project window: {entry['name']}")
     return 0
 
+
+def _project_slot_sequence(count: int, blocked: set[int] | None = None) -> list[int]:
+    blocked = set(blocked or set()) | {SHELL_WINDOW, OPS_WINDOW}
+    out: list[int] = []
+    idx = 1
+    while len(out) < count:
+        if idx not in blocked:
+            out.append(idx)
+        idx += 1
+    return out
+
+
+def compact_project_indices() -> list[tuple[str, int, int]]:
+    """Fill holes in project window numbers while preserving project order."""
+    data = load_registry()
+    rows = sorted(
+        data["workspaces"].items(),
+        key=lambda kv: (
+            int(kv[1].get("window_index", 9999)),
+            str(kv[1].get("name", "")).casefold(),
+        ),
+    )
+    live_rows = tmux_windows()
+    live_by_wid = {
+        str(x.get("workspace_id")): x for x in live_rows if x.get("workspace_id")
+    }
+    blocked = {
+        int(x["index"])
+        for x in live_rows
+        if not x.get("workspace_id")
+        and int(x.get("index", -1)) not in {SHELL_WINDOW, OPS_WINDOW}
+    }
+    targets = _project_slot_sequence(len(rows), blocked)
+    desired: list[tuple[str, dict[str, Any], int, int]] = []
+    for (wid, entry), target in zip(rows, targets):
+        try:
+            old = int(entry.get("window_index", target))
+        except Exception:
+            old = target
+        desired.append((wid, entry, old, target))
+
+    moves = [
+        (wid, old, target)
+        for wid, _entry, old, target in desired
+        if old != target
+    ]
+    live_moves = [
+        (wid, old, target)
+        for wid, old, target in moves
+        if wid in live_by_wid
+    ]
+    if live_moves and tmux_has_session():
+        used = {int(x["index"]) for x in live_rows}
+        temp = max(used | {20}) + 20
+        staged: list[tuple[str, int, int]] = []
+        for wid, old, target in live_moves:
+            while temp in used or temp in {SHELL_WINDOW, OPS_WINDOW}:
+                temp += 1
+            run(
+                [
+                    "tmux", "move-window",
+                    "-s", f"{MASTER_SESSION}:{old}",
+                    "-t", f"{MASTER_SESSION}:{temp}",
+                ],
+                check=True,
+            )
+            used.discard(old)
+            used.add(temp)
+            staged.append((wid, temp, target))
+            temp += 1
+        for wid, current, target in staged:
+            run(
+                [
+                    "tmux", "move-window",
+                    "-s", f"{MASTER_SESSION}:{current}",
+                    "-t", f"{MASTER_SESSION}:{target}",
+                ],
+                check=True,
+            )
+
+    for wid, _entry, _old, target in desired:
+        data["workspaces"][wid]["window_index"] = target
+    save_registry(data)
+    return moves
+
+
+def delete_project(query: str) -> int:
+    """Delete a workspace registration only; never delete the repository or state."""
+    entry = resolve_registered_query(query)
+    wid = str(entry["id"])
+    live = window_for_workspace(wid)
+    if live:
+        idx = int(live["index"])
+        run(["tmux", "select-window", "-t", f"{MASTER_SESSION}:{SHELL_WINDOW}"])
+        run(["tmux", "kill-window", "-t", f"{MASTER_SESSION}:{idx}"], check=True)
+
+    data = load_registry()
+    removed = data["workspaces"].pop(wid, None)
+    if removed is None:
+        raise SystemExit(f"project disappeared from registry: {query!r}")
+    save_registry(data)
+
+    try:
+        moves = compact_project_indices()
+    except Exception as exc:
+        moves = []
+        print(
+            f"warning: project removed but window-number compaction failed: {exc}",
+            file=sys.stderr,
+        )
+
+    print(f"deleted project registration: {entry['name']}")
+    print(f"repo preserved:  {entry['repo']}")
+    print(f"state preserved: {entry['project_base']}")
+    if moves:
+        summary = ", ".join(f"{wid}:{old}->{new}" for wid, old, new in moves)
+        print(f"compacted project slots: {summary}")
+    return 0
+
+
 def master_layout() -> int:
     if not tmux_has_session():
         print(f"{MASTER_SESSION}: not running")
@@ -908,6 +1038,9 @@ def main() -> int:
     closep = sub.add_parser("close")
     closep.add_argument("query", nargs="?")
 
+    deletep = sub.add_parser("delete", aliases=["remove", "unregister"])
+    deletep.add_argument("query")
+
     restartp = sub.add_parser("restart")
     restartp.add_argument("query", nargs="?")
     restartp.add_argument("--all", action="store_true")
@@ -947,6 +1080,8 @@ def main() -> int:
         return set_alias(ns.project, ns.alias)
     if ns.cmd == "close":
         return close_project(ns.query)
+    if ns.cmd in {"delete", "remove", "unregister"}:
+        return delete_project(ns.query)
     if ns.cmd == "restart":
         return restart_project(
             ns.query,
