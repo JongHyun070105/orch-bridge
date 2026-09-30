@@ -26,7 +26,7 @@ jobs:
         run: |
           pr_number="$(gh pr list --repo JongHyun070105/orch-bridge --base main --state open \
             --json number,headRefName \
-            --jq '.[] | select(.headRefName == "release-please--branches--main") | .number' | head -n 1)"
+            --jq '.[] | select(.headRefName | startswith("release-please--branches--main")) | .number' | head -n 1)"
           if [[ -z "$pr_number" ]]; then
             echo "No open Release Please pull request to validate."
           else
