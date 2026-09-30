@@ -12,13 +12,13 @@ Local multi-provider coding-agent orchestrator with adaptive routing, safe deleg
 
 OrchBridge runs multiple AI coding CLIs behind one TUI and one routing layer. It can choose a MAIN agent, delegate independent checks, preserve project-scoped state, queue follow-up work, manage safe Git branches, show quota/health information, and notify you when long-running work finishes.
 
-> **v1.1.0** — current public release. Adds persistent same-job steering and advanced provider diagnostics while supporting macOS and Linux.
+> **v1.2.0** — current public release. Adds terminal-safe input deduplication, project registry cleanup, and list-backed Tab completion on top of v1.1 steering/provider diagnostics.
 
 ## Quick start
 
 ```bash
-curl -fLO https://github.com/JongHyun070105/orch-bridge/releases/download/v1.1.0/orchbridge-v1.1.0.sh
-bash orchbridge-v1.1.0.sh
+curl -fLO https://github.com/JongHyun070105/orch-bridge/releases/download/v1.2.0/orchbridge-v1.2.0.sh
+bash orchbridge-v1.2.0.sh
 orch doctor
 orch settings detect
 cd ~/Projects/my-project
@@ -49,6 +49,8 @@ Most coding-agent CLIs are excellent on their own, but real work often needs mor
 - **Quota/health awareness** with stale-cache fallback rather than fake numbers
 - **Persistent same-job steering** with `/steer <instruction>`, checkpointing, and crash-safe resume
 - **Provider runtime doctor** that resolves PATH/NVM/login-shell installs and diagnoses broken local CLI installs without auto-repair
+- **Terminal-safe prompt submission** that strips leaked ANSI/SGR mouse reports and suppresses accidental duplicate submits/queue entries
+- **Project registry cleanup + smart Tab completion** for registered projects and local branches
 - **Textual TUI** with a working `Ctrl+P` command palette
 - **Portable settings CLI**: `orch settings`
 
@@ -59,7 +61,7 @@ Most coding-agent CLIs are excellent on their own, but real work often needs mor
 | macOS | Supported | `terminal-notifier` or built-in `osascript` | `pbcopy` |
 | Linux | Supported | `notify-send` | `wl-copy`, `xclip`, or `xsel` |
 
-Windows is not supported in v1.1. WSL2 may work as a Linux environment but is not part of the v1.1 support contract.
+Windows is not supported in v1.1. WSL2 may work as a Linux environment but is not part of the v1.2 support contract.
 
 ## Requirements
 
@@ -84,16 +86,16 @@ OrchBridge does **not** install or store credentials for these providers. Each p
 
 ### Release asset
 
-Download `orchbridge-v1.1.0.sh` from the [v1.1.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.1.0), or fetch it directly:
+Download `orchbridge-v1.2.0.sh` from the [v1.2.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.2.0), or fetch it directly:
 
 ```bash
-bash orchbridge-v1.1.0.sh
+bash orchbridge-v1.2.0.sh
 ```
 
 If Git/tmux/Python support is missing and you want the installer to use Homebrew, apt, dnf, or pacman:
 
 ```bash
-bash orchbridge-v1.1.0.sh --install-system-deps
+bash orchbridge-v1.2.0.sh --install-system-deps
 ```
 
 ### Development checkout
@@ -179,6 +181,21 @@ orch settings model gemini_high gemini-3.8-flash-high
 `auto` means “use this provider when its CLI is installed.” Missing or disabled CLIs are removed from routing instead of crashing the run.
 Detection does not make provider network calls or inspect credentials. Each upstream CLI remains responsible for authentication, subscriptions, and API access.
 
+## v1.2 input and project UX
+
+If terminal/tmux control reports leak into the composer, OrchBridge removes the ANSI/SGR transport noise and blocks the first submit so you can verify the cleaned prompt before sending it.
+
+Identical prompt + attachment submissions within a short safety window are suppressed so a single Enter/key-repeat cannot create both a running job and an identical queued follow-up.
+
+Registered projects can be removed without deleting their repository or saved OrchBridge state:
+
+```text
+/project delete <name>
+orch-project delete <name|slot>
+```
+
+After deletion, registered project slots are compacted. Tab completion is backed by the real project registry for `/project open|close|delete` and by local Git branches for `/branch switch|next`.
+
 ## TUI commands
 
 Common commands include:
@@ -211,7 +228,7 @@ Common commands include:
 
 Press `Ctrl+P`, select with arrow keys, and press `Enter`.
 
-v1.1 keeps OrchBridge's priority composer bindings disabled while Textual's `CommandPalette` screen is active, so `Enter` reaches the selected palette command instead of being stolen by the composer.
+v1.2 keeps OrchBridge's priority composer bindings disabled while Textual's `CommandPalette` screen is active, so `Enter` reaches the selected palette command instead of being stolen by the composer.
 
 ## Permissions
 
@@ -332,7 +349,7 @@ The YAML files are examples/specifications, not executable workflow plans in v1.
 
 ## Limitations
 
-- Windows is not officially supported in v1.1.0.
+- Windows is not officially supported in v1.2.0.
 - Provider capabilities and authentication depend on upstream CLIs, subscriptions, and local setup.
 - Quota information is best-effort and can be unavailable or stale.
 - Workflow YAML files are reference examples; a declarative workflow execution engine is not included.
