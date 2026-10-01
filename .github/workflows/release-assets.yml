@@ -32,10 +32,10 @@ jobs:
           TAG="${INPUT_TAG:-$EVENT_TAG}"
           [[ -n "$TAG" ]] || { echo "release tag is required" >&2; exit 2; }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ steps.release-tag.outputs.tag }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - name: Install release test dependencies
