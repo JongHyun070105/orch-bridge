@@ -912,14 +912,27 @@ def _project_slot_sequence(count: int, blocked: set[int] | None = None) -> list[
 
 
 def compact_project_indices() -> list[tuple[str, int, int]]:
-    """Compact LIVE unpinned project windows while respecting pinned/manual slots."""
+    """Compact live windows and keep the registry collision-free.
+
+    LIVE unpinned projects receive the lowest available slots first. Pinned
+    slots and manual tmux windows are preserved. Closed unpinned projects are
+    then assigned spare registry slots, but the UI still presents them as
+    `auto` because those numbers are not reservations.
+    """
     data = load_registry()
     live_rows = tmux_windows()
-    live_by_wid = {str(x.get("workspace_id")): x for x in live_rows if x.get("workspace_id")}
-    manual_blocked = {
-        int(x["index"]) for x in live_rows
-        if not x.get("workspace_id") and int(x.get("index", -1)) not in {SHELL_WINDOW, OPS_WINDOW}
+    live_by_wid = {
+        str(x.get("workspace_id")): x
+        for x in live_rows
+        if x.get("workspace_id")
     }
+    manual_blocked = {
+        int(x["index"])
+        for x in live_rows
+        if not x.get("workspace_id")
+        and int(x.get("index", -1)) not in {SHELL_WINDOW, OPS_WINDOW}
+    }
+
     pinned_slots: dict[int, str] = {}
     for wid, entry in data["workspaces"].items():
         if not bool(entry.get("slot_pinned", False)):
@@ -933,9 +946,12 @@ def compact_project_indices() -> list[tuple[str, int, int]]:
         if idx in pinned_slots and pinned_slots[idx] != wid:
             raise RuntimeError(f"duplicate pinned project slot {idx}")
         pinned_slots[idx] = wid
+
     conflict = manual_blocked & set(pinned_slots)
     if conflict:
-        raise RuntimeError(f"pinned project slot {sorted(conflict)[0]} is occupied by a manual tmux window")
+        raise RuntimeError(
+            f"pinned project slot {sorted(conflict)[0]} is occupied by a manual tmux window"
+        )
 
     live_registered: list[tuple[str, dict[str, Any], int]] = []
     for wid, row in live_by_wid.items():
@@ -945,16 +961,42 @@ def compact_project_indices() -> list[tuple[str, int, int]]:
 
     desired: dict[str, int] = {}
     used = set(manual_blocked) | set(pinned_slots) | {SHELL_WINDOW, OPS_WINDOW}
-    for wid, entry, _old in live_registered:
-        if bool(entry.get("slot_pinned", False)):
-            desired[wid] = int(entry["window_index"])
 
-    unpinned = sorted(
-        [(wid, entry, old) for wid, entry, old in live_registered if not bool(entry.get("slot_pinned", False))],
+    # Pinned registrations keep their explicit slot whether currently live or closed.
+    for idx, wid in pinned_slots.items():
+        desired[wid] = idx
+
+    # LIVE unpinned projects get first claim on compact auto slots.
+    unpinned_live = sorted(
+        [
+            (wid, entry, old)
+            for wid, entry, old in live_registered
+            if not bool(entry.get("slot_pinned", False))
+        ],
         key=lambda row: (row[2], str(row[1].get("name", "")).casefold()),
     )
     next_idx = 1
-    for wid, _entry, _old in unpinned:
+    for wid, _entry, _old in unpinned_live:
+        while next_idx in used:
+            next_idx += 1
+        desired[wid] = next_idx
+        used.add(next_idx)
+        next_idx += 1
+
+    # Preserve the v1.2 registry-compaction contract for closed auto projects.
+    closed_unpinned = sorted(
+        [
+            (wid, entry)
+            for wid, entry in data["workspaces"].items()
+            if wid not in live_by_wid and not bool(entry.get("slot_pinned", False))
+        ],
+        key=lambda row: (
+            int(row[1].get("window_index", 9999)),
+            str(row[1].get("name", "")).casefold(),
+        ),
+    )
+    next_idx = 1
+    for wid, _entry in closed_unpinned:
         while next_idx in used:
             next_idx += 1
         desired[wid] = next_idx
@@ -966,6 +1008,7 @@ def compact_project_indices() -> list[tuple[str, int, int]]:
         for wid, _entry, old in live_registered
         if desired.get(wid, old) != old
     ]
+
     if moves and tmux_has_session():
         occupied = {int(x["index"]) for x in live_rows}
         temp = max(occupied | {20}) + 20
@@ -973,13 +1016,27 @@ def compact_project_indices() -> list[tuple[str, int, int]]:
         for wid, old, target in moves:
             while temp in occupied or temp in {SHELL_WINDOW, OPS_WINDOW}:
                 temp += 1
-            run(["tmux", "move-window", "-s", f"{MASTER_SESSION}:{old}", "-t", f"{MASTER_SESSION}:{temp}"], check=True)
+            run(
+                [
+                    "tmux", "move-window",
+                    "-s", f"{MASTER_SESSION}:{old}",
+                    "-t", f"{MASTER_SESSION}:{temp}",
+                ],
+                check=True,
+            )
             occupied.discard(old)
             occupied.add(temp)
             staged.append((wid, temp, target))
             temp += 1
         for wid, current, target in staged:
-            run(["tmux", "move-window", "-s", f"{MASTER_SESSION}:{current}", "-t", f"{MASTER_SESSION}:{target}"], check=True)
+            run(
+                [
+                    "tmux", "move-window",
+                    "-s", f"{MASTER_SESSION}:{current}",
+                    "-t", f"{MASTER_SESSION}:{target}",
+                ],
+                check=True,
+            )
 
     for wid, target in desired.items():
         if wid in data["workspaces"]:
