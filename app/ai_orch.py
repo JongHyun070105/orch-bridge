@@ -391,6 +391,8 @@ def parse_cmd_ndjson(stdout: str) -> tuple[str, dict[str, Any] | None]:
 
 def maybe_probe_commandcode_quota() -> None:
     """Probe an exhausted Command Code account at most once per backoff window."""
+    if not effective_provider_enabled(config, "commandcode"):
+        return
     if not global_provider_unavailable("commandcode") or not global_probe_due("commandcode"):
         return
     exe = resolve_provider_cli("commandcode", config)
@@ -669,14 +671,14 @@ candidates = [
     Candidate("gemini-high", "AGY/Gemini 3.8 Flash High", "agy", "google",
               models.get("gemini_high", "gemini-3.8-flash-high"),
               "gemini", .80, .29, gemini_q, gemini_reset),
-    Candidate("claude-sonnet", "Claude Code/Sonnet 5.5 (subscription)", "claude", "anthropic",
+    Candidate("claude-sonnet", "Claude Code/Sonnet 5.5", "claude", "anthropic",
               claude_code_model("sonnet", models.get("claude_sonnet")),
               "claude-pro", .95, .46),
     Candidate("sonnet", "AGY/Sonnet 4.6 Thinking", "agy", "anthropic",
               models.get("sonnet", "claude-sonnet-4-6-thinking"),
               "third", .94, .50, third_q, third_reset),
     Candidate("codex", "Codex", "codex", "openai", None, None, .93, .62),
-    Candidate("claude-opus", "Claude Code/Opus 5.5 (subscription)", "claude", "anthropic",
+    Candidate("claude-opus", "Claude Code/Opus 5.5", "claude", "anthropic",
               claude_code_model("opus", models.get("claude_opus")),
               "claude-pro", .99, .90),
     Candidate("opus", "AGY/Opus 4.6 Thinking", "agy", "anthropic",
@@ -821,9 +823,7 @@ if global_provider_unavailable("commandcode"):
     log(f"Command Code global status: {global_provider_summary('commandcode')} · auto fallback active")
 viable_ranked = [c for c in candidates if c.utility > -99]
 log("route utility (not raw model quality): " + " > ".join(
-    f"{c.key}(u={c.utility:.2f},cap={c.capability:.2f},avail={c.availability:.2f}"
-    f",recent={c.recent_penalty:+.2f}"
-    f"{',learn=%+.2f' % c.quality_adjustment if c.quality_adjustment else ''})"
+    f"{c.key}({c.utility:.2f})"
     for c in viable_ranked[:7]
 ))
 if global_provider_unavailable("commandcode"):
@@ -1446,7 +1446,7 @@ def run_claude(prompt: str, model: str) -> Outcome:
                 effort_label = effort or "Claude Code default"
                 log(
                     f"[{label}] started · model={actual} · effort={effort_label}"
-                    f" · effort_source={effort_source} · auth=Claude.ai subscription"
+                    f" · effort_source={effort_source}"
                 )
             elif kind == "reasoning":
                 log(f"[{label}] reasoning…")

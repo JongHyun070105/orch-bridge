@@ -71,6 +71,7 @@ def migrate_legacy_claude_models(data: dict[str, Any]) -> list[str]:
             changed.append(key)
         elif key not in models:
             models[key] = DEFAULT_MODELS[key]
+            changed.append(key)
     return changed
 
 
