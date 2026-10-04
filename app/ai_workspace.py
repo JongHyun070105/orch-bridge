@@ -181,9 +181,10 @@ def display_name(repo: Path, wid: str) -> str:
 
 
 def used_preferred_indices(data: dict[str, Any], exclude: str | None = None) -> set[int]:
+    """Reserve only explicitly pinned slots plus currently live tmux windows."""
     out: set[int] = set()
     for wid, w in data["workspaces"].items():
-        if wid == exclude:
+        if wid == exclude or not bool(w.get("slot_pinned", False)):
             continue
         try:
             idx = int(w.get("window_index"))
@@ -191,8 +192,14 @@ def used_preferred_indices(data: dict[str, Any], exclude: str | None = None) -> 
             continue
         if idx not in {SHELL_WINDOW, OPS_WINDOW}:
             out.add(idx)
+    try:
+        for row in tmux_windows():
+            idx = int(row.get("index", -1))
+            if idx not in {SHELL_WINDOW, OPS_WINDOW}:
+                out.add(idx)
+    except Exception:
+        pass
     return out
-
 
 def allocate_index(data: dict[str, Any], exclude: str | None = None) -> int:
     used = used_preferred_indices(data, exclude=exclude)
@@ -244,6 +251,7 @@ def register(repo_input: str | Path, *, preferred_index: int | None = None) -> d
         "repo": str(repo),
         "project_base": str(ensure_project_dirs(wid)),
         "window_index": idx,
+        "slot_pinned": bool(old.get("slot_pinned", False)),
         "created_at": old.get("created_at") or time.time(),
         "last_opened_at": old.get("last_opened_at"),
     }
@@ -432,12 +440,25 @@ def ensure_master_session(cwd: Path | None = None) -> None:
 def choose_runtime_index(entry: dict[str, Any]) -> int:
     preferred = int(entry.get("window_index", 1))
     occupied = {int(x["index"]): x for x in tmux_windows()}
-    if preferred not in occupied:
+    if str(occupied.get(preferred, {}).get("workspace_id") or "") == entry["id"]:
         return preferred
-    if str(occupied[preferred].get("workspace_id") or "") == entry["id"]:
+    if bool(entry.get("slot_pinned", False)):
+        if preferred in occupied:
+            raise SystemExit(
+                f"pinned window {preferred} is occupied; "
+                "use `orch-project slot <project> <other|auto>`"
+            )
         return preferred
 
     used = set(occupied)
+    data = load_registry()
+    for wid, other in data["workspaces"].items():
+        if wid == entry.get("id") or not bool(other.get("slot_pinned", False)):
+            continue
+        try:
+            used.add(int(other.get("window_index")))
+        except Exception:
+            pass
     for idx in PRIMARY_PROJECT_SLOTS:
         if idx not in used:
             return idx
@@ -572,13 +593,19 @@ def list_projects(as_json: bool = False) -> int:
         return 0
 
     print(f"PROJECTS · tmux session {MASTER_SESSION}")
-    print("    WIN  STATE  PROJECT                   REPO")
+    print("    WIN   PIN  STATE  PROJECT                   REPO")
     for w in enriched:
         mark = "*" if w.get("id") == current_wid else " "
         win = w.get("live_window")
-        win_text = str(win) if win is not None else str(w.get("window_index", "-"))
+        if win is not None:
+            win_text = str(win)
+        elif bool(w.get("slot_pinned", False)):
+            win_text = str(w.get("window_index", "-"))
+        else:
+            win_text = "auto"
         state = "LIVE" if win is not None else "-"
-        print(f"{mark}   {win_text:<3}  {state:<5} {str(w.get('name')):<25} {w.get('repo')}")
+        pin = "yes" if bool(w.get("slot_pinned", False)) else "-"
+        print(f"{mark}   {win_text:<5} {pin:<4} {state:<5} {str(w.get('name')):<25} {w.get('repo')}")
     print("\nreserved: 0=shell · 9=ops")
     print("remove stale registration: orch-project delete <project>  (repo/state are preserved)")
     return 0
@@ -866,7 +893,10 @@ def close_project(query: str | None = None) -> int:
     idx = int(live["index"])
     run(["tmux", "select-window", "-t", f"{MASTER_SESSION}:0"])
     run(["tmux", "kill-window", "-t", f"{MASTER_SESSION}:{idx}"], check=True)
+    moves = compact_project_indices()
     print(f"closed project window: {entry['name']}")
+    if moves:
+        print("compacted live slots: " + ", ".join(f"{wid}:{old}->{new}" for wid, old, new in moves))
     return 0
 
 
@@ -882,77 +912,126 @@ def _project_slot_sequence(count: int, blocked: set[int] | None = None) -> list[
 
 
 def compact_project_indices() -> list[tuple[str, int, int]]:
-    """Fill holes in project window numbers while preserving project order."""
+    """Compact LIVE unpinned project windows while respecting pinned/manual slots."""
     data = load_registry()
-    rows = sorted(
-        data["workspaces"].items(),
-        key=lambda kv: (
-            int(kv[1].get("window_index", 9999)),
-            str(kv[1].get("name", "")).casefold(),
-        ),
-    )
     live_rows = tmux_windows()
-    live_by_wid = {
-        str(x.get("workspace_id")): x for x in live_rows if x.get("workspace_id")
+    live_by_wid = {str(x.get("workspace_id")): x for x in live_rows if x.get("workspace_id")}
+    manual_blocked = {
+        int(x["index"]) for x in live_rows
+        if not x.get("workspace_id") and int(x.get("index", -1)) not in {SHELL_WINDOW, OPS_WINDOW}
     }
-    blocked = {
-        int(x["index"])
-        for x in live_rows
-        if not x.get("workspace_id")
-        and int(x.get("index", -1)) not in {SHELL_WINDOW, OPS_WINDOW}
-    }
-    targets = _project_slot_sequence(len(rows), blocked)
-    desired: list[tuple[str, dict[str, Any], int, int]] = []
-    for (wid, entry), target in zip(rows, targets):
+    pinned_slots: dict[int, str] = {}
+    for wid, entry in data["workspaces"].items():
+        if not bool(entry.get("slot_pinned", False)):
+            continue
         try:
-            old = int(entry.get("window_index", target))
+            idx = int(entry.get("window_index"))
         except Exception:
-            old = target
-        desired.append((wid, entry, old, target))
+            continue
+        if idx in {SHELL_WINDOW, OPS_WINDOW}:
+            continue
+        if idx in pinned_slots and pinned_slots[idx] != wid:
+            raise RuntimeError(f"duplicate pinned project slot {idx}")
+        pinned_slots[idx] = wid
+    conflict = manual_blocked & set(pinned_slots)
+    if conflict:
+        raise RuntimeError(f"pinned project slot {sorted(conflict)[0]} is occupied by a manual tmux window")
+
+    live_registered: list[tuple[str, dict[str, Any], int]] = []
+    for wid, row in live_by_wid.items():
+        entry = data["workspaces"].get(wid)
+        if isinstance(entry, dict):
+            live_registered.append((wid, entry, int(row["index"])))
+
+    desired: dict[str, int] = {}
+    used = set(manual_blocked) | set(pinned_slots) | {SHELL_WINDOW, OPS_WINDOW}
+    for wid, entry, _old in live_registered:
+        if bool(entry.get("slot_pinned", False)):
+            desired[wid] = int(entry["window_index"])
+
+    unpinned = sorted(
+        [(wid, entry, old) for wid, entry, old in live_registered if not bool(entry.get("slot_pinned", False))],
+        key=lambda row: (row[2], str(row[1].get("name", "")).casefold()),
+    )
+    next_idx = 1
+    for wid, _entry, _old in unpinned:
+        while next_idx in used:
+            next_idx += 1
+        desired[wid] = next_idx
+        used.add(next_idx)
+        next_idx += 1
 
     moves = [
-        (wid, old, target)
-        for wid, _entry, old, target in desired
-        if old != target
+        (wid, old, desired[wid])
+        for wid, _entry, old in live_registered
+        if desired.get(wid, old) != old
     ]
-    live_moves = [
-        (wid, old, target)
-        for wid, old, target in moves
-        if wid in live_by_wid
-    ]
-    if live_moves and tmux_has_session():
-        used = {int(x["index"]) for x in live_rows}
-        temp = max(used | {20}) + 20
+    if moves and tmux_has_session():
+        occupied = {int(x["index"]) for x in live_rows}
+        temp = max(occupied | {20}) + 20
         staged: list[tuple[str, int, int]] = []
-        for wid, old, target in live_moves:
-            while temp in used or temp in {SHELL_WINDOW, OPS_WINDOW}:
+        for wid, old, target in moves:
+            while temp in occupied or temp in {SHELL_WINDOW, OPS_WINDOW}:
                 temp += 1
-            run(
-                [
-                    "tmux", "move-window",
-                    "-s", f"{MASTER_SESSION}:{old}",
-                    "-t", f"{MASTER_SESSION}:{temp}",
-                ],
-                check=True,
-            )
-            used.discard(old)
-            used.add(temp)
+            run(["tmux", "move-window", "-s", f"{MASTER_SESSION}:{old}", "-t", f"{MASTER_SESSION}:{temp}"], check=True)
+            occupied.discard(old)
+            occupied.add(temp)
             staged.append((wid, temp, target))
             temp += 1
         for wid, current, target in staged:
-            run(
-                [
-                    "tmux", "move-window",
-                    "-s", f"{MASTER_SESSION}:{current}",
-                    "-t", f"{MASTER_SESSION}:{target}",
-                ],
-                check=True,
-            )
+            run(["tmux", "move-window", "-s", f"{MASTER_SESSION}:{current}", "-t", f"{MASTER_SESSION}:{target}"], check=True)
 
-    for wid, _entry, _old, target in desired:
-        data["workspaces"][wid]["window_index"] = target
+    for wid, target in desired.items():
+        if wid in data["workspaces"]:
+            data["workspaces"][wid]["window_index"] = target
     save_registry(data)
     return moves
+
+
+def set_project_slot(query: str, value: str) -> int:
+    entry = resolve_registered_query(query)
+    wid = str(entry["id"])
+    data = load_registry()
+    current = data["workspaces"].get(wid)
+    if not isinstance(current, dict):
+        raise SystemExit(f"project disappeared from registry: {query!r}")
+    raw = str(value).strip().lower()
+    if raw == "auto":
+        current["slot_pinned"] = False
+        data["workspaces"][wid] = current
+        save_registry(data)
+        moves = compact_project_indices()
+        latest = load_registry()["workspaces"][wid]
+        print(f"project slot auto: {latest['name']} · window {latest.get('window_index')}")
+        if moves:
+            print("compacted live slots: " + ", ".join(f"{w}:{a}->{b}" for w, a, b in moves))
+        return 0
+    try:
+        target = int(raw)
+    except Exception:
+        raise SystemExit("slot must be a number or 'auto'")
+    if target <= 0 or target in {SHELL_WINDOW, OPS_WINDOW}:
+        raise SystemExit(f"window {target} is reserved/invalid")
+    for other_wid, other in data["workspaces"].items():
+        if other_wid == wid or not bool(other.get("slot_pinned", False)):
+            continue
+        try:
+            if int(other.get("window_index")) == target:
+                raise SystemExit(f"window {target} is pinned by project {other.get('name')}")
+        except (TypeError, ValueError):
+            pass
+    for row in tmux_windows():
+        if int(row.get("index", -1)) == target and not row.get("workspace_id"):
+            raise SystemExit(f"window {target} is occupied by a manual tmux window")
+    current["window_index"] = target
+    current["slot_pinned"] = True
+    data["workspaces"][wid] = current
+    save_registry(data)
+    moves = compact_project_indices()
+    print(f"project slot pinned: {current['name']} -> {target}")
+    if moves:
+        print("compacted live slots: " + ", ".join(f"{w}:{a}->{b}" for w, a, b in moves))
+    return 0
 
 
 def delete_project(query: str) -> int:
@@ -1041,6 +1120,10 @@ def main() -> int:
     deletep = sub.add_parser("delete", aliases=["remove", "unregister"])
     deletep.add_argument("query")
 
+    slotp = sub.add_parser("slot")
+    slotp.add_argument("query")
+    slotp.add_argument("value")
+
     restartp = sub.add_parser("restart")
     restartp.add_argument("query", nargs="?")
     restartp.add_argument("--all", action="store_true")
@@ -1082,6 +1165,8 @@ def main() -> int:
         return close_project(ns.query)
     if ns.cmd in {"delete", "remove", "unregister"}:
         return delete_project(ns.query)
+    if ns.cmd == "slot":
+        return set_project_slot(ns.query, ns.value)
     if ns.cmd == "restart":
         return restart_project(
             ns.query,
