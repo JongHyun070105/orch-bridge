@@ -159,7 +159,7 @@ def test_router_visibility_and_cmd_exclusion_surfaces():
     assert m
     panel = mod.pretty_router_panel(m.group(1))
     assert "Claude Code Sonnet 5.5 (1.68)" in panel
-    assert "Gemini 3.8 Flash · high(1.43)" in panel
+    assert "Gemini 3.8 Flash · high (1.43)" in panel
     assert "subscription" not in panel.lower()
     assert "GLOBAL_PROVIDER_HEALTH_FILE" in tui
     assert "elif m := ROUTE_RE.match(line):" in tui
