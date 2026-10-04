@@ -51,6 +51,29 @@ def defaults() -> dict[str, Any]:
     }
 
 
+LEGACY_CLAUDE_MODEL_ALIASES = {
+    "claude_sonnet": {"sonnet", "claude-sonnet-5", "claude-sonnet-5-0"},
+    "claude_opus": {"opus", "claude-opus-5", "claude-opus-5-0"},
+}
+
+
+def migrate_legacy_claude_models(data: dict[str, Any]) -> list[str]:
+    """Upgrade only old OrchBridge defaults; preserve explicit custom model IDs."""
+    models = data.setdefault("models", {})
+    if not isinstance(models, dict):
+        models = {}
+        data["models"] = models
+    changed: list[str] = []
+    for key, aliases in LEGACY_CLAUDE_MODEL_ALIASES.items():
+        value = str(models.get(key) or "").strip().lower()
+        if value in aliases:
+            models[key] = DEFAULT_MODELS[key]
+            changed.append(key)
+        elif key not in models:
+            models[key] = DEFAULT_MODELS[key]
+    return changed
+
+
 def load() -> dict[str, Any]:
     try:
         obj = json.loads(CONFIG_PATH.read_text())
@@ -85,7 +108,11 @@ def detect() -> dict[str, Any]:
 
 def ensure_config(*, overwrite: bool = False) -> dict[str, Any]:
     if CONFIG_PATH.exists() and not overwrite:
-        return load()
+        data = load()
+        changed = migrate_legacy_claude_models(data)
+        if changed:
+            save(data)
+        return data
     data = defaults()
     save(data)
     return data
