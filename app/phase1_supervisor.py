@@ -20,6 +20,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from provider_health_state import (
+    clear_provider as clear_global_provider,
+    mark_quota_exhausted as mark_global_quota_exhausted,
+    provider_status as global_provider_status,
+    provider_unavailable as global_provider_unavailable,
+)
+
 HOME = Path.home()
 BASE = HOME / ".local/share/orchbridge"
 PROJECT_BASE = Path(os.getenv("AI_ORCH_PROJECT_BASE", str(BASE))).expanduser().resolve()
@@ -50,13 +57,13 @@ TARGETS = {
     },
     "sonnet": {
         "backend": "agy",
-        "model": "claude-sonnet-4-6",
-        "label": "Claude Sonnet 4.6",
+        "model": "claude-sonnet-4-6-thinking",
+        "label": "Claude Sonnet 4.6 Thinking",
     },
     "opus": {
         "backend": "agy",
         "model": "claude-opus-4-6-thinking",
-        "label": "Claude Opus 4.6",
+        "label": "Claude Opus 4.6 Thinking",
     },
     "gemini-low": {
         "backend": "agy",
@@ -149,6 +156,7 @@ def _delegates_used_for_job(con: sqlite3.Connection, parent_job_id: str) -> int:
         FROM delegations
         WHERE parent_job_id = ?
           AND worker_id NOT LIKE 'quota-%'
+          AND status NOT IN ('BLOCKED', 'CANCELLED')
         """,
         (parent_job_id,),
     ).fetchone()
@@ -169,6 +177,9 @@ def _save_provider_health(data: dict[str, Any]) -> None:
 
 
 def _health_blocked(target: str) -> tuple[bool, dict[str, Any] | None]:
+    if target == "cmd" and global_provider_unavailable("commandcode"):
+        g = global_provider_status("commandcode")
+        return True, {**g, "global": True, "status": "QUOTA_EXHAUSTED"}
     data = _load_provider_health()
     item = data.get(target)
     if not isinstance(item, dict):
@@ -180,6 +191,8 @@ def _health_blocked(target: str) -> tuple[bool, dict[str, Any] | None]:
 
 
 def _health_mark_success(target: str) -> None:
+    if target == "cmd":
+        clear_global_provider("commandcode", source="delegate_success")
     data = _load_provider_health()
     if target in data:
         data[target] = {
@@ -195,6 +208,25 @@ def _health_mark_success(target: str) -> None:
 
 def _health_mark_failure(target: str, failure_class: str | None) -> None:
     if not failure_class:
+        return
+    if target == "cmd" and failure_class == "CREDIT_EXHAUSTED":
+        mark_global_quota_exhausted(
+            "commandcode",
+            reason="credit/quota exhausted",
+            source="delegate",
+            retry_after_seconds=3600,
+        )
+        data = _load_provider_health()
+        old = data.get(target, {}) if isinstance(data.get(target), dict) else {}
+        data[target] = {
+            "status": "QUOTA_EXHAUSTED",
+            "blocked_until": 0,
+            "failure_class": failure_class,
+            "failure_count": int(old.get("failure_count") or 0) + 1,
+            "updated_at": _now(),
+            "updated_at_iso": _iso(),
+        }
+        _save_provider_health(data)
         return
 
     cooldowns = {
@@ -238,64 +270,119 @@ def _quota_viable(target: str) -> tuple[bool, float | None]:
     return value > QUOTA_RESERVE, value
 
 
-def _auto_target(caller: str) -> str:
-    """
-    Select a cheap cross-provider worker using cached quota.
+def _recent_target_counts(limit: int = 18) -> dict[str, int]:
+    if not DB_PATH.exists():
+        return {}
+    try:
+        con = sqlite3.connect(DB_PATH)
+        try:
+            rows = con.execute(
+                """
+                SELECT target FROM delegations
+                WHERE worker_id NOT LIKE 'quota-%'
+                ORDER BY started_at DESC LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return {}
+    counts: dict[str, int] = {}
+    for row in rows:
+        target = str(row[0] or "")
+        if target:
+            counts[target] = counts.get(target, 0) + 1
+    return counts
 
-    Phase 1 priority intentionally prefers CMD for AGY/Codex MAINs, and
-    Gemini-low for CMD MAINs. Same-provider targets are skipped.
-    """
+
+def _delegate_task_role(task: str) -> str:
+    text = str(task or "").casefold()
+    review_terms = (
+        "review", "audit", "verify", "verification", "second opinion", "independent",
+        "evidence", "security", "risk", "regression", "proof",
+        "검토", "감사", "검증", "독립", "근거", "보안", "리스크",
+    )
+    research_terms = (
+        "research", "compare", "survey", "investigate", "sources", "benchmark",
+        "조사", "비교", "자료", "리서치", "벤치마크",
+    )
+    implementation_terms = (
+        "implement", "fix", "debug", "patch", "refactor", "code", "test", "build",
+        "구현", "수정", "디버그", "리팩터", "코드", "테스트", "빌드",
+    )
+    if any(term in text for term in review_terms):
+        return "review"
+    if any(term in text for term in research_terms):
+        return "research"
+    if any(term in text for term in implementation_terms):
+        return "implementation"
+    return "general"
+
+
+def _task_affinity(task: str, target: str) -> float:
+    raw = hashlib.sha256((str(task or "") + "\0" + target).encode("utf-8")).digest()
+    return int.from_bytes(raw[:2], "big") / 65535.0
+
+
+def _auto_target(caller: str, task: str = "") -> str:
     caller_backend = _caller_backend(caller)
-
-    if caller_backend == "cmd":
-        order = [
-            "gemini-low",
-            "sonnet",
-            "gemini-medium",
-            "codex",
-            "gemini-high",
-            "opus",
-        ]
-    elif caller_backend == "codex":
-        order = [
-            "cmd",
-            "gemini-low",
-            "sonnet",
-            "gemini-medium",
-            "gemini-high",
-            "opus",
-        ]
-    else:
-        order = [
-            "cmd",
-            "codex",
-            "gemini-low",
-            "gemini-medium",
-            "sonnet",
-            "gemini-high",
-            "opus",
-        ]
-
-    viable_unknown: list[str] = []
-    for target in order:
+    role = _delegate_task_role(task)
+    role_capability = {
+        "review": {
+            "sonnet": .98, "opus": 1.00, "codex": .94, "gemini-high": .88,
+            "gemini-medium": .79, "cmd": .72, "gemini-low": .66,
+        },
+        "research": {
+            "gemini-high": .95, "sonnet": .93, "codex": .90, "gemini-medium": .86,
+            "cmd": .76, "gemini-low": .75, "opus": .98,
+        },
+        "implementation": {
+            "codex": .97, "sonnet": .92, "cmd": .89, "gemini-high": .85,
+            "gemini-medium": .80, "gemini-low": .72, "opus": .98,
+        },
+        "general": {
+            "codex": .95, "sonnet": .92, "cmd": .86, "gemini-high": .86,
+            "gemini-medium": .80, "gemini-low": .73, "opus": .98,
+        },
+    }[role]
+    costs = {"cmd": 1, "gemini-low": 1, "gemini-medium": 2, "sonnet": 3,
+             "gemini-high": 3, "codex": 4, "opus": 9}
+    order = ["sonnet", "gemini-high", "cmd", "gemini-medium", "gemini-low", "codex"]
+    if str(os.environ.get("AI_ORCH_AUTO_INCLUDE_OPUS", "0")) == "1":
+        order.append("opus")
+    recent = _recent_target_counts()
+    ranked: list[tuple[float, str]] = []
+    for base_rank, target in enumerate(order):
         if target == caller:
             continue
         if caller_backend and TARGETS[target]["backend"] == caller_backend:
             continue
-
-        blocked, _health = _health_blocked(target)
+        blocked, _ = _health_blocked(target)
         if blocked:
             continue
-
         ok, rem = _quota_viable(target)
-        if ok and rem is not None:
-            return target
-        if ok and rem is None:
-            viable_unknown.append(target)
-
-    if viable_unknown:
-        return viable_unknown[0]
-
+        if not ok:
+            continue
+        cap = float(role_capability.get(target, .70))
+        score = (
+            2.8 * float(recent.get(target, 0))
+            + 3.0 * (1.0 - cap)
+            + 0.045 * float(costs.get(target, 3))
+            + 0.025 * float(base_rank)
+            - (0.0 if rem is None else min(.85, max(0.0, float(rem)) / 100.0))
+            - .38 * _task_affinity(task, target)
+            - (.38 if role == "review" and target == "sonnet" else 0.0)
+        )
+        ranked.append((score, target))
+    if ranked:
+        ranked.sort(key=lambda row: (row[0], row[1]))
+        chosen = ranked[0][1]
+        print(
+            f"[delegate] auto-select role={role} -> {chosen} (recent={recent.get(chosen, 0)})",
+            file=sys.stderr, flush=True,
+        )
+        return chosen
     raise RuntimeError("NO_CROSS_PROVIDER_TARGET_WITH_QUOTA")
 
 
@@ -1366,6 +1453,8 @@ def _classify_failure(
     if rc == 0:
         return None
     text = f"{stdout}\n{stderr}".lower()
+    if rc == 10 or re.search(r"insufficient credits|credit limit|credits? exhausted|out of credits|no credits", text):
+        return "CREDIT_EXHAUSTED"
     if re.search(r"usage limit|rate.?limit|quota|try again at|too many requests", text):
         return "RATE_LIMIT"
     if re.search(r"unauthori[sz]ed|authentication|not logged in|\\b401\\b|\\b403\\b", text):
@@ -1558,7 +1647,7 @@ def delegate(args: argparse.Namespace) -> int:
 
     if requested_target == "auto":
         try:
-            target = _auto_target(caller)
+            target = _auto_target(caller, task)
         except Exception as e:
             result = WorkerResult(
                 status="BLOCKED",
