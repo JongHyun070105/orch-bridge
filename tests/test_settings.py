@@ -9,7 +9,8 @@ p=ROOT/'app/settings_cli.py'; spec=importlib.util.spec_from_file_location('setti
 
 def test_default_models_and_providers_are_portable():
     d=m.defaults(); assert set(d['providers'])=={'codex','claude','agy','commandcode'}
-    assert d['models']['claude_sonnet']=='sonnet'
+    assert d['models']['claude_sonnet']=='claude-sonnet-5-5'
+    assert d['models']['claude_opus']=='claude-opus-5-5'
     assert d['models']['commandcode']=='xiaomi/mimo-v2.5-pro'
 
 def test_auto_provider_only_enables_installed_binary():
@@ -33,3 +34,20 @@ def test_model_values_can_be_changed_through_settings_command(tmp_path, monkeypa
     assert m.main()==0
     saved=json.loads(config_path.read_text())
     assert saved['models']['commandcode']=='xiaomi/custom-model'
+
+
+def test_legacy_claude_aliases_migrate_but_custom_ids_are_preserved(tmp_path, monkeypatch):
+    config_dir=tmp_path/'.config/orchbridge'
+    config_path=config_dir/'config.json'
+    config_dir.mkdir(parents=True)
+    data=m.defaults()
+    data['models']['claude_sonnet']='sonnet'
+    data['models']['claude_opus']='my-custom-opus'
+    config_path.write_text(json.dumps(data))
+    monkeypatch.setattr(m,'CONFIG_DIR',config_dir)
+    monkeypatch.setattr(m,'CONFIG_PATH',config_path)
+    loaded=m.ensure_config()
+    assert loaded['models']['claude_sonnet']=='claude-sonnet-5-5'
+    assert loaded['models']['claude_opus']=='my-custom-opus'
+    saved=json.loads(config_path.read_text())
+    assert saved['models']==loaded['models']
