@@ -526,7 +526,7 @@ def pretty_route(route: str) -> str:
     }
     out = route
     for key, label in mapping.items():
-        out = re.sub(rf"\b{re.escape(key)}(?=\()", label, out)
+        out = re.sub(rf"\b{re.escape(key)}(?=\()", label + " ", out)
     return out
 
 
