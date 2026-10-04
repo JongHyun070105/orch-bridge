@@ -14,21 +14,32 @@
     "Linux"
   ],
   "components": {
-    "ai_chat_tui": "1.2.0",
+    "ai_chat_tui": "1.3.0",
     "ai_chat": "1.0.0",
-    "ai_orch": "1.1.0",
-    "ai_workspace": "1.2.0",
+    "ai_orch": "1.3.0",
+    "ai_workspace": "1.3.0",
     "desktop_notify": "1.0.0",
-    "settings_cli": "1.1.0",
-    "phase1_supervisor": "1.0.0",
-    "phase3_orchestrator": "1.0.0",
+    "settings_cli": "1.3.0",
+    "phase1_supervisor": "1.3.0",
+    "phase3_orchestrator": "1.3.0",
     "provider_runtime": "1.1.0",
-    "provider_doctor": "1.1.0"
+    "provider_doctor": "1.1.0",
+    "provider_health_state": "1.3.0",
+    "claude_runtime": "1.3.0"
   },
   "steering_schema": 1,
   "provider_health_schema": 1,
   "input_safety_schema": 1,
   "queue_dedupe_schema": 1,
   "project_registry_delete_schema": 1,
-  "smart_tab_completion_schema": 1
+  "smart_tab_completion_schema": 1,
+  "scheduled_prompt_schema": 1,
+  "global_provider_health_schema": 1,
+  "transcript_follow_schema": 1,
+  "live_slot_compaction_schema": 1,
+  "project_slot_pin_schema": 1,
+  "proactive_delegation_schema": 1,
+  "claude_runtime_schema": 1,
+  "agy_model_breaker_schema": 1,
+  "router_visibility_schema": 1
 }

@@ -21,6 +21,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from provider_health_state import (
+    clear_provider as clear_global_provider,
+    mark_quota_exhausted as mark_global_quota_exhausted,
+    provider_status as global_provider_status,
+    provider_unavailable as global_provider_unavailable,
+)
+
 HOME = Path.home()
 BASE = HOME / ".local/share/orchbridge"
 APP = BASE / "app"
@@ -29,6 +36,7 @@ CACHE = HOME / ".cache/orchbridge"
 PROJECT_BASE = Path(os.environ.get("AI_ORCH_PROJECT_BASE", str(BASE))).expanduser().resolve()
 JOBS_DIR = PROJECT_BASE / "jobs"
 DELEGATIONS_DIR = PROJECT_BASE / "delegations"
+DB_PATH = DELEGATIONS_DIR / "registry.sqlite3"
 PHASE3_DIR = PROJECT_BASE / "phase3"
 BATCHES_DIR = PHASE3_DIR / "batches"
 HANDOFFS_DIR = PHASE3_DIR / "handoffs"
@@ -45,8 +53,8 @@ QUOTA_RESERVE = float(os.environ.get("AI_ORCH_DELEGATE_QUOTA_RESERVE", "3"))
 TARGETS: dict[str, dict[str, Any]] = {
     "codex": {"backend": "codex", "model": None, "label": "GPT-6 Luna", "pool": "codex", "cost": 4},
     "cmd": {"backend": "cmd", "model": "xiaomi/mimo-v2.5-pro", "label": "MiMo V2.5 Pro", "pool": "cmd", "cost": 1},
-    "sonnet": {"backend": "agy", "model": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "pool": "agy-third", "cost": 3},
-    "opus": {"backend": "agy", "model": "claude-opus-4-6-thinking", "label": "Claude Opus 4.6", "pool": "agy-third", "cost": 9},
+    "sonnet": {"backend": "agy", "model": "claude-sonnet-4-6-thinking", "label": "Claude Sonnet 4.6 Thinking", "pool": "agy-third", "cost": 3},
+    "opus": {"backend": "agy", "model": "claude-opus-4-6-thinking", "label": "Claude Opus 4.6 Thinking", "pool": "agy-third", "cost": 9},
     "gemini-low": {"backend": "agy", "model": "gemini-3.8-flash-low", "label": "Gemini 3.8 Flash low", "pool": "agy-gemini", "cost": 1},
     "gemini-medium": {"backend": "agy", "model": "gemini-3.8-flash-medium", "label": "Gemini 3.8 Flash medium", "pool": "agy-gemini", "cost": 2},
     "gemini-high": {"backend": "agy", "model": "gemini-3.8-flash-high", "label": "Gemini 3.8 Flash high", "pool": "agy-gemini", "cost": 3},
@@ -163,6 +171,9 @@ def health_state(target: str) -> dict[str, Any]:
 
 
 def health_blocked(target: str) -> tuple[bool, dict[str, Any]]:
+    if target == "cmd" and global_provider_unavailable("commandcode"):
+        g = global_provider_status("commandcode")
+        return True, {**g, "global": True, "status": "QUOTA_EXHAUSTED"}
     item = health_state(target)
     until = float(item.get("blocked_until") or 0)
     return until > now(), item
@@ -173,6 +184,8 @@ def save_provider_health(data: dict[str, Any]) -> None:
 
 
 def health_mark_success(target: str) -> None:
+    if target == "cmd":
+        clear_global_provider("commandcode", source="phase3_success")
     data = load_json(PROVIDER_HEALTH_PATH)
     data[target] = {
         "status": "HEALTHY",
@@ -187,6 +200,21 @@ def health_mark_success(target: str) -> None:
 
 def health_mark_failure(target: str, failure_class: str | None) -> None:
     if not failure_class:
+        return
+    if target == "cmd" and failure_class == "CREDIT_EXHAUSTED":
+        mark_global_quota_exhausted(
+            "commandcode", reason="credit/quota exhausted", source="phase3",
+            retry_after_seconds=3600,
+        )
+        data = load_json(PROVIDER_HEALTH_PATH)
+        old = data.get(target, {}) if isinstance(data.get(target), dict) else {}
+        data[target] = {
+            "status": "QUOTA_EXHAUSTED", "blocked_until": 0,
+            "failure_class": failure_class,
+            "failure_count": int(old.get("failure_count") or 0) + 1,
+            "updated_at": now(), "updated_at_iso": iso(),
+        }
+        save_provider_health(data)
         return
     cooldowns = {
         "RATE_LIMIT": 15 * 60,
@@ -263,48 +291,129 @@ def target_viable(target: str) -> tuple[bool, dict[str, Any]]:
     }
 
 
-def auto_targets(caller: str, count: int, *, include_opus: bool = False) -> list[str]:
+def _recent_target_counts(limit: int = 24) -> dict[str, int]:
+    if not DB_PATH.exists():
+        return {}
+    try:
+        con = sqlite3.connect(DB_PATH)
+        try:
+            rows = con.execute(
+                """
+                SELECT target FROM delegations
+                WHERE worker_id NOT LIKE 'quota-%'
+                ORDER BY started_at DESC LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return {}
+    counts: dict[str, int] = {}
+    for row in rows:
+        target = str(row[0] or "")
+        if target:
+            counts[target] = counts.get(target, 0) + 1
+    return counts
+
+
+def _collab_task_role(task: str, kind: str = "parallel") -> str:
+    text = str(task or "").casefold()
+    if kind == "consult":
+        return "review"
+    if any(x in text for x in (
+        "review", "audit", "verify", "second opinion", "independent", "evidence",
+        "security", "risk", "regression", "final", "검토", "감사", "검증", "독립", "근거",
+    )):
+        return "review"
+    if any(x in text for x in (
+        "research", "compare", "survey", "sources", "benchmark", "조사", "비교", "리서치",
+    )):
+        return "research"
+    if any(x in text for x in (
+        "implement", "fix", "debug", "patch", "refactor", "code", "test",
+        "구현", "수정", "디버그", "리팩터", "코드", "테스트",
+    )):
+        return "implementation"
+    return "general"
+
+
+def _task_affinity(task: str, target: str) -> float:
+    raw = hashlib.sha256((str(task or "") + "\0" + target).encode("utf-8")).digest()
+    return int.from_bytes(raw[:2], "big") / 65535.0
+
+
+def auto_targets(
+    caller: str,
+    count: int,
+    *,
+    include_opus: bool = False,
+    task: str = "",
+    kind: str = "parallel",
+) -> list[str]:
     count = max(1, min(MAX_PARALLEL, count))
     current_target = caller_target(caller)
     current_pool = caller_pool(caller)
-
-    priority = ["cmd", "gemini-low", "sonnet", "codex", "gemini-medium", "gemini-high"]
+    role = _collab_task_role(task, kind)
+    role_capability = {
+        "review": {"sonnet": .98, "opus": 1.00, "codex": .94, "gemini-high": .89,
+                   "gemini-medium": .80, "cmd": .72, "gemini-low": .66},
+        "research": {"gemini-high": .96, "sonnet": .93, "codex": .90, "gemini-medium": .87,
+                     "cmd": .76, "gemini-low": .75, "opus": .98},
+        "implementation": {"codex": .97, "sonnet": .92, "cmd": .89, "gemini-high": .85,
+                           "gemini-medium": .80, "gemini-low": .72, "opus": .98},
+        "general": {"codex": .95, "sonnet": .92, "cmd": .86, "gemini-high": .86,
+                    "gemini-medium": .80, "gemini-low": .73, "opus": .98},
+    }[role]
+    priority = ["sonnet", "gemini-high", "cmd", "gemini-medium", "gemini-low", "codex"]
     if include_opus:
         priority.append("opus")
-
-    known: list[tuple[float, int, str]] = []
-    unknown: list[tuple[int, str]] = []
-    seen_pools: set[str] = set()
-
-    for target in priority:
+    recent = _recent_target_counts()
+    ranked: list[tuple[float, str, str]] = []
+    for base_rank, target in enumerate(priority):
         spec = TARGETS[target]
         pool = str(spec["pool"])
         if target == current_target or pool == current_pool:
-            continue
-        if pool in seen_pools:
             continue
         viable, detail = target_viable(target)
         if not viable:
             continue
         rem = detail["remaining_pct"]
-        if rem is None:
-            unknown.append((int(spec["cost"]), target))
-        else:
-            # Prefer cheaper targets, then healthier quota. Cost dominates to
-            # preserve scarce high-end pools; quota breaks ties.
-            known.append((float(spec["cost"]), -float(rem), target))
+        cap = float(role_capability.get(target, .70))
+        score = (
+            2.8 * float(recent.get(target, 0))
+            + 3.0 * (1.0 - cap)
+            + 0.045 * float(spec["cost"])
+            + 0.025 * float(base_rank)
+            - (0.0 if rem is None else min(.85, max(0.0, float(rem)) / 100.0))
+            - .38 * _task_affinity(task, target)
+            - (.40 if role == "review" and target == "sonnet" else 0.0)
+        )
+        ranked.append((score, target, pool))
+    ranked.sort(key=lambda row: (row[0], row[1]))
+    ordered: list[str] = []
+    seen_pools: set[str] = set()
+    for _score, target, pool in ranked:
+        if pool in seen_pools:
+            continue
+        ordered.append(target)
         seen_pools.add(pool)
-
-    known.sort()
-    unknown.sort()
-    ordered = [x[2] for x in known] + [x[1] for x in unknown]
-    return ordered[:count]
+        if len(ordered) >= count:
+            break
+    return ordered
 
 
-def parse_models(text: str | None, caller: str, count: int, include_opus: bool) -> list[str]:
+def parse_models(
+    text: str | None,
+    caller: str,
+    count: int,
+    include_opus: bool,
+    *,
+    task: str = "",
+    kind: str = "parallel",
+) -> list[str]:
     if not text or text.strip().lower() == "auto":
-        return auto_targets(caller, count, include_opus=include_opus)
-
+        return auto_targets(caller, count, include_opus=include_opus, task=task, kind=kind)
     raw = [x.strip() for x in text.split(",") if x.strip()]
     out: list[str] = []
     current = caller_target(caller)
@@ -328,12 +437,15 @@ def delegate_budget_remaining(parent_job_id: str) -> tuple[int, int, int]:
     except Exception:
         maximum = 3
     used = 0
-    db = DELEGATIONS_DIR / "registry.sqlite3"
-    if db.exists():
+    if DB_PATH.exists():
         try:
-            con = sqlite3.connect(db)
+            con = sqlite3.connect(DB_PATH)
             row = con.execute(
-                "SELECT COUNT(*) FROM delegations WHERE parent_job_id=? AND worker_id NOT LIKE 'quota-%'",
+                """
+                SELECT COUNT(*) FROM delegations
+                WHERE parent_job_id=? AND worker_id NOT LIKE 'quota-%'
+                  AND status NOT IN ('BLOCKED', 'CANCELLED')
+                """,
                 (parent_job_id,),
             ).fetchone()
             con.close()
@@ -569,7 +681,7 @@ def run_batch(args: argparse.Namespace, kind: str) -> int:
         }, ensure_ascii=False, indent=2))
         return 25
     launch_count = min(requested_count, remaining)
-    targets = parse_models(args.models, caller, launch_count, args.include_opus)
+    targets = parse_models(args.models, caller, launch_count, args.include_opus, task=task, kind=kind)
     if not targets:
         payload = {
             "status": "BLOCKED",
@@ -985,6 +1097,8 @@ def classify_failure(rc: int, stdout: str, stderr: str) -> str | None:
     if rc == 0:
         return None
     text = f"{stdout}\n{stderr}".lower()
+    if rc == 10 or re.search(r"insufficient credits|credit limit|credits? exhausted|quota exhausted|out of credits|no credits", text):
+        return "CREDIT_EXHAUSTED"
     if re.search(r"usage limit|rate.?limit|quota|try again at|too many requests", text):
         return "RATE_LIMIT"
     if re.search(r"unauthori[sz]ed|authentication|not logged in|\b401\b|\b403\b", text):

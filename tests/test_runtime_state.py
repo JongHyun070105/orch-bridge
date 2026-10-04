@@ -128,11 +128,13 @@ def test_reload_refreshes_settings_and_queue_without_replacing_worker(tui_module
         ]
     )
     queue = {"items": [{"id": "queue-2", "prompt": "keep me"}]}
+    schedule = {"items": [{"id": "schedule-1", "prompt": "later"}]}
     worker = object()
     fake = SimpleNamespace(
         _current_runtime_state=lambda: next(snapshots),
         _load_tui_state=lambda: None,
         _load_queue_state=lambda: queue,
+        _load_schedule_state=lambda: schedule,
         update_banner=lambda: None,
         update_commandbar=lambda: None,
         proc=worker,
@@ -141,6 +143,7 @@ def test_reload_refreshes_settings_and_queue_without_replacing_worker(tui_module
     message = tui_module.OrchBridgeApp._reload_project_settings(fake)
     assert "changed: model_override" in message
     assert fake.queue_state == queue
+    assert fake.schedule_state == schedule
     assert fake.proc is worker
 
 

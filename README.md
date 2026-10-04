@@ -12,13 +12,13 @@ Local multi-provider coding-agent orchestrator with adaptive routing, safe deleg
 
 OrchBridge runs multiple AI coding CLIs behind one TUI and one routing layer. It can choose a MAIN agent, delegate independent checks, preserve project-scoped state, queue follow-up work, manage safe Git branches, show quota/health information, and notify you when long-running work finishes.
 
-> **v1.2.0** — current public release. Adds terminal-safe input deduplication, project registry cleanup, and list-backed Tab completion on top of v1.1 steering/provider diagnostics.
+> **v1.3.0** — quality-first routing, persistent scheduled prompts, proactive cross-provider collaboration, Claude Code 5.5 with adaptive effort, global quota-aware fallback, router visibility, transcript auto-follow, and project slot pin/compaction.
 
 ## Quick start
 
 ```bash
-curl -fLO https://github.com/JongHyun070105/orch-bridge/releases/download/v1.2.0/orchbridge-v1.2.0.sh
-bash orchbridge-v1.2.0.sh
+curl -fLO https://github.com/JongHyun070105/orch-bridge/releases/download/v1.3.0/orchbridge-v1.3.0.sh
+bash orchbridge-v1.3.0.sh
 orch doctor
 orch settings detect
 cd ~/Projects/my-project
@@ -51,8 +51,42 @@ Most coding-agent CLIs are excellent on their own, but real work often needs mor
 - **Provider runtime doctor** that resolves PATH/NVM/login-shell installs and diagnoses broken local CLI installs without auto-repair
 - **Terminal-safe prompt submission** that strips leaked ANSI/SGR mouse reports and suppresses accidental duplicate submits/queue entries
 - **Project registry cleanup + smart Tab completion** for registered projects and local branches
+- **Persistent scheduled prompts** that enter the project FIFO queue when due without interrupting an active job
+- **Global provider health fallback** so exhausted Command Code credit is excluded from MAIN/judge/delegate routing until a bounded recovery probe succeeds
+- **Role-aware proactive collaboration** that favors independent reviewers/researchers and does not spend useful delegate budget on provider-level blocked calls
+- **Claude Code 5.5 defaults + adaptive effort** with visible progress/tool activity but no hidden chain-of-thought exposure
+- **Visible ranked router utility** including exclusion reasons, quota availability, capability, and recent-use penalties
+- **Project slot pin/auto controls** plus live-window compaction and transcript auto-follow
 - **Textual TUI** with a working `Ctrl+P` command palette
 - **Portable settings CLI**: `orch settings`
+
+## v1.3 scheduling and routing
+
+Scheduled prompts are project-local and persistent:
+
+```text
+/schedule 16:00 review the completed validation
+/schedule in 45m check CI and summarize failures
+/schedule tomorrow 09:00 prepare the next task
+/schedule
+/schedule cancel <number|schedule-id>
+/schedule clear
+```
+
+A due schedule is added to the same persistent FIFO queue used by normal follow-up prompts. It **does not steer or interrupt the currently running job**. If the active job runs past the scheduled time, the scheduled task waits and starts when earlier queue work finishes. If the TUI was stopped, overdue schedules are delivered when that project TUI starts again.
+
+Command Code credit exhaustion is tracked separately from short rate/network failures. A globally exhausted CMD provider is excluded from MAIN routing, the micro-judge, delegates, consults, and parallel workers. The router continues scoring healthy providers and periodically performs a bounded recovery probe.
+
+Project window numbers can be left automatic or pinned explicitly:
+
+```text
+/project slot my-project 3
+/project slot my-project auto
+orch-project slot my-project 3
+orch-project slot my-project auto
+```
+
+Closing a live unpinned project compacts the remaining live project numbers while pinned slots stay fixed.
 
 ## Supported platforms
 
@@ -61,7 +95,7 @@ Most coding-agent CLIs are excellent on their own, but real work often needs mor
 | macOS | Supported | `terminal-notifier` or built-in `osascript` | `pbcopy` |
 | Linux | Supported | `notify-send` | `wl-copy`, `xclip`, or `xsel` |
 
-Windows is not supported in v1.1. WSL2 may work as a Linux environment but is not part of the v1.2 support contract.
+Windows is not supported in v1.3. WSL2 may work as a Linux environment but is not part of the v1.3 support contract.
 
 ## Requirements
 
@@ -86,16 +120,16 @@ OrchBridge does **not** install or store credentials for these providers. Each p
 
 ### Release asset
 
-Download `orchbridge-v1.2.0.sh` from the [v1.2.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.2.0), or fetch it directly:
+Download `orchbridge-v1.3.0.sh` from the [v1.3.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.3.0), or fetch it directly:
 
 ```bash
-bash orchbridge-v1.2.0.sh
+bash orchbridge-v1.3.0.sh
 ```
 
 If Git/tmux/Python support is missing and you want the installer to use Homebrew, apt, dnf, or pacman:
 
 ```bash
-bash orchbridge-v1.2.0.sh --install-system-deps
+bash orchbridge-v1.3.0.sh --install-system-deps
 ```
 
 ### Development checkout
@@ -172,8 +206,8 @@ orch settings provider claude on
 orch settings provider agy off
 orch settings provider commandcode auto
 
-orch settings model claude_sonnet sonnet
-orch settings model claude_opus opus
+orch settings model claude_sonnet claude-sonnet-5-5
+orch settings model claude_opus claude-opus-5-5
 orch settings model commandcode xiaomi/mimo-v2.5-pro
 orch settings model gemini_high gemini-3.8-flash-high
 ```
@@ -349,7 +383,7 @@ The YAML files are examples/specifications, not executable workflow plans in v1.
 
 ## Limitations
 
-- Windows is not officially supported in v1.2.0.
+- Windows is not officially supported in v1.3.0.
 - Provider capabilities and authentication depend on upstream CLIs, subscriptions, and local setup.
 - Quota information is best-effort and can be unavailable or stale.
 - Workflow YAML files are reference examples; a declarative workflow execution engine is not included.
