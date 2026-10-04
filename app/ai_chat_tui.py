@@ -10,7 +10,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -101,7 +101,9 @@ APP_DIR = BASE / "app"
 JOBS_DIR = PROJECT_BASE / "jobs"
 TUI_STATE_FILE = PROJECT_BASE / "tui-state.json"
 QUEUE_FILE = PROJECT_BASE / "task-queue.json"
+SCHEDULE_FILE = PROJECT_BASE / "scheduled-prompts.json"
 ROUTER_STATE_FILE = HOME / ".cache/orchbridge/router-state.json"
+GLOBAL_PROVIDER_HEALTH_FILE = HOME / ".cache/orchbridge/provider-global-health.json"
 DELEGATION_EVENTS_FILE = PROJECT_BASE / "delegations/events.jsonl"
 DELEGATION_REGISTRY_DB = PROJECT_BASE / "delegations/registry.sqlite3"
 WORKER = APP_DIR / "ai_job_worker.py"
@@ -174,7 +176,11 @@ def iter_known_job_dirs() -> list[Path]:
 
 ATTEMPT_RE = re.compile(r"^\[ai-orch\] trying MAIN:\s*(.+?)\s*$")
 TASK_STATUS_RE = re.compile(r"^\[ai-orch\] (?:FINAL_)?TASK_STATUS:\s*(\w+)")
-ROUTE_RE = re.compile(r"^\[ai-orch\] route:\s*(.+)$")
+ROUTE_RE = re.compile(
+    r"^\[ai-orch\] route(?: utility \(not raw model quality\))?:\s*(.+)$"
+)
+DECISION_RE = re.compile(r"^\[ai-orch\] decision:\s*(.+)$")
+ROUTE_EXCLUDED_RE = re.compile(r"^\[ai-orch\] route excluded:\s*(.+)$")
 QUOTA_RE = re.compile(r"^\[ai-orch\] quota:\s*(.+)$")
 MODEL_TOOL_RE = re.compile(r"^\[ai-orch\] \[([^\]]+?) tool\]\s*(.+)$")
 MODEL_PROGRESS_RE = re.compile(r"^\[ai-orch\] \[([^\]]+)\]\s*(.+)$")
@@ -221,6 +227,7 @@ SLASH_COMMANDS = [
     ("/project alias reviewai", "tmux 탭의 짧은 별칭 설정"),
     ("/project close", "현재 프로젝트 창 닫기"),
     ("/project delete <name>", "등록된 프로젝트를 목록에서 제거 (repo/state 보존)"),
+    ("/project slot <name> <number|auto>", "프로젝트 번호 고정(pin) 또는 자동 관리"),
     ("/restart", "현재 프로젝트 TUI를 같은 창에서 즉시 재시작"),
     ("/reload", "프로젝트/TUI 저장 설정을 다시 읽기"),
     ("/version", "현재 로드된 TUI와 설치된 버전 비교"),
@@ -241,6 +248,10 @@ SLASH_COMMANDS = [
     ("/queue clear", "실행 중 작업은 유지하고 대기열 비우기"),
     ("/queue pause", "현재 작업은 유지하고 다음 작업 자동 시작 멈추기"),
     ("/queue resume", "대기열 자동 실행 재개; 중단 게이트는 명시적으로 건너뛰기"),
+    ("/schedule", "예약 프롬프트 목록 보기"),
+    ("/schedule <time> <prompt>", "미래 시각에 새 작업을 persistent queue로 전달"),
+    ("/schedule cancel <id>", "예약 프롬프트 하나 취소"),
+    ("/schedule clear", "대기 중 예약 프롬프트 전체 취소"),
     ("/branch", "현재 브랜치 / HEAD / dirty 상태 보기"),
     ("/branch list", "로컬 브랜치 목록 보기"),
     ("/branch switch <name>", "기존 브랜치로 안전하게 전환"),
@@ -263,8 +274,8 @@ SLASH_COMMANDS = [
     ("/model codex", "GPT-6 Luna로 모델 고정"),
     ("/model sonnet", "AGY Claude Sonnet 4.6 Thinking으로 모델 고정"),
     ("/model opus", "AGY Claude Opus 4.6 Thinking으로 모델 고정"),
-    ("/model claude", "새 Claude Pro 계정의 Claude Code Sonnet으로 모델 고정"),
-    ("/model claude-opus", "새 Claude Pro 계정의 Claude Code Opus로 모델 고정"),
+    ("/model claude", "Claude.ai 구독 Claude Code Sonnet 5.5로 모델 고정"),
+    ("/model claude-opus", "Claude.ai 구독 Claude Code Opus 5.5로 모델 고정"),
     ("/model gemini-low", "Gemini 3.8 Flash low로 모델 고정"),
     ("/model gemini-medium", "Gemini 3.8 Flash medium으로 모델 고정"),
     ("/model gemini-high", "Gemini 3.8 Flash high로 모델 고정"),
@@ -326,6 +337,84 @@ _ACTUAL_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _LITERAL_CSI_RE = re.compile(r"\^\[\[[0-?]*[ -/]*[@-~]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 SUBMIT_DEDUPE_SECONDS = 12.0
+
+
+_SCHEDULE_DURATION_RE = re.compile(
+    r"(?:(?P<days>\d+)d)?(?:(?P<hours>\d+)h)?(?:(?P<minutes>\d+)m)?(?:(?P<seconds>\d+)s)?$",
+    re.I,
+)
+
+
+def _local_now(reference: datetime | None = None) -> datetime:
+    if reference is None:
+        return datetime.now().astimezone()
+    if reference.tzinfo is None:
+        return reference.astimezone()
+    return reference
+
+
+def parse_schedule_request(spec: str, reference: datetime | None = None) -> tuple[datetime, str]:
+    raw = str(spec or "").strip()
+    if not raw:
+        raise ValueError("schedule time and prompt are required")
+    now_local = _local_now(reference)
+
+    m = re.match(r"^in\s+(\S+)\s+(.+)$", raw, re.I | re.S)
+    if m:
+        token, prompt = m.group(1), m.group(2).strip()
+        dm = _SCHEDULE_DURATION_RE.fullmatch(token)
+        if not dm or not any(dm.groupdict().values()):
+            raise ValueError("relative time must look like 30m, 2h, 1h30m, or 1d")
+        parts = {k: int(v or 0) for k, v in dm.groupdict().items()}
+        delta = timedelta(
+            days=parts["days"], hours=parts["hours"],
+            minutes=parts["minutes"], seconds=parts["seconds"],
+        )
+        if delta.total_seconds() <= 0 or not prompt:
+            raise ValueError("schedule must be in the future and include a prompt")
+        return now_local + delta, prompt
+
+    m = re.match(r"^(today|tomorrow|오늘|내일)\s+(\d{1,2}:\d{2})\s+(.+)$", raw, re.I | re.S)
+    if m:
+        word, hhmm, prompt = m.group(1).lower(), m.group(2), m.group(3).strip()
+        hour, minute = map(int, hhmm.split(":"))
+        if hour > 23 or minute > 59:
+            raise ValueError("time must be HH:MM")
+        days = 1 if word in {"tomorrow", "내일"} else 0
+        due = (now_local + timedelta(days=days)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        if days == 0 and due <= now_local:
+            raise ValueError("that time has already passed today")
+        return due, prompt
+
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})\s+(.+)$", raw, re.S)
+    if m:
+        date_text, hhmm, prompt = m.group(1), m.group(2), m.group(3).strip()
+        try:
+            naive = datetime.strptime(f"{date_text} {hhmm}", "%Y-%m-%d %H:%M")
+        except ValueError as exc:
+            raise ValueError("date/time must be YYYY-MM-DD HH:MM") from exc
+        due = naive.replace(tzinfo=now_local.tzinfo)
+        if due <= now_local:
+            raise ValueError("schedule must be in the future")
+        return due, prompt
+
+    m = re.match(r"^(\d{1,2}:\d{2})\s+(.+)$", raw, re.S)
+    if m:
+        hhmm, prompt = m.group(1), m.group(2).strip()
+        hour, minute = map(int, hhmm.split(":"))
+        if hour > 23 or minute > 59:
+            raise ValueError("time must be HH:MM")
+        due = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if due <= now_local:
+            due += timedelta(days=1)
+        return due, prompt
+
+    raise ValueError(
+        "usage: /schedule 14:30 <prompt> | /schedule in 30m <prompt> | "
+        "/schedule 2026-10-04 18:00 <prompt>"
+    )
 
 
 def sanitize_terminal_input(text: str) -> tuple[str, bool]:
@@ -405,9 +494,9 @@ def _codex_display_name() -> str:
 def pretty_model_name(raw: str) -> str:
     lo = raw.lower()
     if "claude code/opus" in lo or "claude-pro/opus" in lo:
-        return "Claude Code Opus · Pro"
+        return "Claude Code Opus 5.5 · subscription"
     if "claude code/sonnet" in lo or "claude-pro/sonnet" in lo:
-        return "Claude Code Sonnet · Pro"
+        return "Claude Code Sonnet 5.5 · subscription"
     if lo.strip() == "codex" or lo.startswith("codex "):
         return _codex_display_name()
     m = re.search(r"\(([^()]+)\)\s*$", raw)
@@ -426,8 +515,8 @@ def pretty_model_name(raw: str) -> str:
 def pretty_route(route: str) -> str:
     mapping = {
         "codex": _codex_display_name(),
-        "claude-sonnet": "Claude Code Sonnet · Pro",
-        "claude-opus": "Claude Code Opus · Pro",
+        "claude-sonnet": "Claude Code Sonnet 5.5 · subscription",
+        "claude-opus": "Claude Code Opus 5.5 · subscription",
         "sonnet": "AGY Claude Sonnet 4.6 Thinking",
         "opus": "AGY Claude Opus 4.6 Thinking",
         "gemini-high": "Gemini 3.8 Flash · high",
@@ -440,6 +529,15 @@ def pretty_route(route: str) -> str:
         out = re.sub(rf"\b{re.escape(key)}(?=\()", label, out)
     return out
 
+
+def pretty_router_panel(route: str) -> str:
+    parts = [x.strip() for x in str(route or "").split(" > ") if x.strip()]
+    return "\n".join(f"{i}. {pretty_route(part)}" for i, part in enumerate(parts, 1)) or "no viable candidates reported"
+
+
+def router_decision_source(decision: str) -> str:
+    m = re.search(r"(?:^|\s)source=([^\s]+)", str(decision or ""))
+    return m.group(1) if m else "unknown"
 
 def parse_reset(text: str) -> float | None:
     m = re.search(
@@ -828,6 +926,8 @@ class OrchBridgeApp(App):
         self.current: Attempt | None = None
         self.verbosity = "normal"
         self.route = ""
+        self.router_decision = ""
+        self.route_excluded = ""
         self.quota = ""
         self.task_status: str | None = None
         self.raw: list[str] = []
@@ -865,6 +965,7 @@ class OrchBridgeApp(App):
         # in legacy-global panes so one repository cannot consume another's work.
         self._queue_notice_key = ""
         self.queue_state = self._load_queue_state()
+        self.schedule_state = self._load_schedule_state()
 
         # One terminal/key event must not become both a running job and an
         # identical queued follow-up.
@@ -1091,6 +1192,7 @@ class OrchBridgeApp(App):
         before = self._current_runtime_state()
         self._load_tui_state()
         self.queue_state = self._load_queue_state()
+        self.schedule_state = self._load_schedule_state()
         self._last_quota_refresh = 0.0
         self.update_banner()
         self.update_commandbar()
@@ -1432,6 +1534,211 @@ class OrchBridgeApp(App):
             self._branch_create(branch, str(plan.get("from") or "HEAD"))
             return
         raise RuntimeError(f"알 수 없는 branch plan mode: {mode}")
+
+    def _schedule_default_state(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "items": [],
+            "history": [],
+            "halted_reason": None,
+            "updated_at": iso(),
+        }
+
+    def _load_schedule_state(self) -> dict[str, Any]:
+        default = self._schedule_default_state()
+        if not SCHEDULE_FILE.exists():
+            return default
+        try:
+            data = json.loads(SCHEDULE_FILE.read_text())
+            if not isinstance(data, dict):
+                raise ValueError("schedule root is not an object")
+            items = data.get("items", [])
+            history = data.get("history", [])
+            if not isinstance(items, list) or not isinstance(history, list):
+                raise ValueError("schedule items/history must be lists")
+            default.update(data)
+            default["items"] = [x for x in items if isinstance(x, dict)]
+            default["history"] = [x for x in history if isinstance(x, dict)][-50:]
+            default["schema_version"] = 1
+            return default
+        except Exception as exc:
+            default["halted_reason"] = f"SCHEDULE_FILE_INVALID: {type(exc).__name__}: {exc}"
+            return default
+
+    def _save_schedule_state(self) -> None:
+        self.schedule_state["schema_version"] = 1
+        self.schedule_state["updated_at"] = iso()
+        history = self.schedule_state.get("history", [])
+        if isinstance(history, list):
+            self.schedule_state["history"] = history[-50:]
+        atomic_json(SCHEDULE_FILE, self.schedule_state)
+
+    def _schedule_resolve_item(self, query: str) -> tuple[int, dict[str, Any]] | None:
+        items = self.schedule_state.get("items", [])
+        q = str(query or "").strip()
+        if q.isdigit():
+            idx = int(q) - 1
+            if 0 <= idx < len(items):
+                return idx, items[idx]
+        exact = [(i, x) for i, x in enumerate(items) if str(x.get("id") or "") == q]
+        if len(exact) == 1:
+            return exact[0]
+        partial = [(i, x) for i, x in enumerate(items) if str(x.get("id") or "").startswith(q)]
+        return partial[0] if len(partial) == 1 else None
+
+    def _schedule_add(self, due: datetime, prompt: str) -> dict[str, Any]:
+        if not self._queue_workspace_ready():
+            raise RuntimeError("scheduled prompts require a registered project workspace")
+        if self.schedule_state.get("halted_reason"):
+            raise RuntimeError(str(self.schedule_state.get("halted_reason")))
+        prompt, contaminated = sanitize_terminal_input(prompt)
+        if contaminated:
+            raise ValueError("scheduled prompt contained terminal control input")
+        prompt = prompt.strip()
+        if not prompt:
+            raise ValueError("scheduled prompt is empty")
+        due = due.astimezone()
+        if due.timestamp() <= now():
+            raise ValueError("schedule must be in the future")
+        item_id = (
+            "sched-" + due.strftime("%Y%m%d-%H%M%S-")
+            + hashlib.sha256((prompt + str(now())).encode("utf-8")).hexdigest()[:6]
+        )
+        item = {
+            "id": item_id,
+            "created_at": iso(),
+            "due_at": due.isoformat(timespec="seconds"),
+            "prompt": prompt,
+            "prompt_sha256": self._prompt_sha(prompt),
+            "attempts": 0,
+            "last_error": None,
+            "retry_at": None,
+        }
+        self.schedule_state.setdefault("items", []).append(item)
+        self.schedule_state["items"].sort(key=lambda x: str(x.get("due_at") or ""))
+        self._save_schedule_state()
+        return item
+
+    def _schedule_cancel(self, query: str) -> tuple[bool, str]:
+        found = self._schedule_resolve_item(query)
+        if found is None:
+            return False, f"schedule not found: {query}"
+        idx, item = found
+        self.schedule_state["items"].pop(idx)
+        history = dict(item)
+        history.update({"status": "CANCELLED", "finished_at": iso()})
+        self.schedule_state.setdefault("history", []).append(history)
+        self._save_schedule_state()
+        return True, f"schedule cancelled · {item.get('id')}"
+
+    def _schedule_clear(self) -> int:
+        items = list(self.schedule_state.get("items", []))
+        stamp = iso()
+        for item in items:
+            history = dict(item)
+            history.update({"status": "CANCELLED", "finished_at": stamp})
+            self.schedule_state.setdefault("history", []).append(history)
+        self.schedule_state["items"] = []
+        self.schedule_state["halted_reason"] = None
+        self._save_schedule_state()
+        return len(items)
+
+    def _schedule_status_text(self) -> str:
+        items = sorted(self.schedule_state.get("items", []), key=lambda x: str(x.get("due_at") or ""))
+        lines = [
+            f"file: {SCHEDULE_FILE}",
+            f"pending: {len(items)}",
+            "behavior: due prompts enter the persistent FIFO queue; they never interrupt the active job",
+        ]
+        if self.schedule_state.get("halted_reason"):
+            lines.append(f"halted: {self.schedule_state.get('halted_reason')}")
+        for i, item in enumerate(items, 1):
+            try:
+                due = datetime.fromisoformat(str(item.get("due_at") or "")).astimezone()
+                due_text = due.strftime("%Y-%m-%d %H:%M:%S %Z")
+            except Exception:
+                due_text = str(item.get("due_at") or "?")
+            prompt = str(item.get("prompt") or "").replace("\n", " ")
+            if len(prompt) > 72:
+                prompt = prompt[:69] + "..."
+            lines.append(f"{i}. {due_text} · {item.get('id')}\n   {prompt}")
+        if not items:
+            lines.append("No scheduled prompts.")
+        return "\n".join(lines)
+
+    def _schedule_tick(self) -> None:
+        if not self._queue_workspace_ready() or self.schedule_state.get("halted_reason"):
+            return
+        items = self.schedule_state.get("items", [])
+        if not items:
+            return
+        now_ts = now()
+        changed = False
+        fired_any = False
+        remaining: list[dict[str, Any]] = []
+        for item in items:
+            try:
+                due_ts = datetime.fromisoformat(str(item.get("due_at") or "")).timestamp()
+            except Exception as exc:
+                bad = dict(item)
+                bad.update({"status": "INVALID", "finished_at": iso(), "last_error": str(exc)})
+                self.schedule_state.setdefault("history", []).append(bad)
+                changed = True
+                continue
+            retry_at = str(item.get("retry_at") or "").strip()
+            if retry_at:
+                try:
+                    if datetime.fromisoformat(retry_at).timestamp() > now_ts:
+                        remaining.append(item)
+                        continue
+                except Exception:
+                    pass
+            if due_ts > now_ts:
+                remaining.append(item)
+                continue
+            if str(self.queue_state.get("halted_reason") or "").startswith("QUEUE_FILE_INVALID"):
+                item["attempts"] = int(item.get("attempts") or 0) + 1
+                item["last_error"] = str(self.queue_state.get("halted_reason"))
+                item["retry_at"] = (
+                    datetime.now().astimezone() + timedelta(minutes=1)
+                ).isoformat(timespec="seconds")
+                remaining.append(item)
+                changed = True
+                continue
+            try:
+                entry = self._queue_enqueue(
+                    str(item.get("prompt") or ""), [], gate=self._queue_busy_gate()
+                )
+            except Exception as exc:
+                item["attempts"] = int(item.get("attempts") or 0) + 1
+                item["last_error"] = f"{type(exc).__name__}: {exc}"
+                item["retry_at"] = (
+                    datetime.now().astimezone() + timedelta(minutes=1)
+                ).isoformat(timespec="seconds")
+                remaining.append(item)
+                changed = True
+                continue
+            hist = dict(item)
+            duplicate = bool(entry.get("_duplicate_suppressed"))
+            hist.update({
+                "status": "DEDUPED" if duplicate else "QUEUED",
+                "finished_at": iso(),
+                "queue_entry_id": entry.get("id"),
+            })
+            self.schedule_state.setdefault("history", []).append(hist)
+            changed = True
+            fired_any = True
+            self.note(
+                f"schedule due · {item.get('id')}\n"
+                + ("duplicate recent queue item suppressed" if duplicate else f"queued · {entry.get('id')}"),
+                title="SCHEDULE DUE",
+                collapsed=False,
+            )
+        if changed:
+            self.schedule_state["items"] = remaining
+            self._save_schedule_state()
+        if fired_any:
+            self._queue_tick()
 
     def _queue_default_state(self) -> dict[str, Any]:
         return {
@@ -2028,6 +2335,8 @@ class OrchBridgeApp(App):
         self.attempts.clear()
         self.current = None
         self.route = ""
+        self.router_decision = ""
+        self.route_excluded = ""
         self.quota = ""
         self.task_status = None
         self.raw.clear()
@@ -2042,8 +2351,8 @@ class OrchBridgeApp(App):
         mapping = {
             "codex": "GPT-6 Luna",
             "cmd": "MiMo V2.5 Pro",
-            "claude-sonnet": "Claude Code Sonnet · Pro",
-            "claude-opus": "Claude Code Opus · Pro",
+            "claude-sonnet": "Claude Code Sonnet 5.5 · subscription",
+            "claude-opus": "Claude Code Opus 5.5 · subscription",
             "sonnet": "AGY Claude Sonnet 4.6 Thinking",
             "opus": "AGY Claude Opus 4.6 Thinking",
             "gemini-low": "Gemini 3.8 Flash · low",
@@ -2166,6 +2475,18 @@ class OrchBridgeApp(App):
             rows.append("\n".join(block))
         return "\n\n".join(rows)
 
+    def _follow_feed_bottom(self) -> None:
+        """Keep the transcript following newly appended messages/progress."""
+        def do_scroll() -> None:
+            try:
+                self.query_one("#feed", VerticalScroll).scroll_end(animate=False)
+            except Exception:
+                pass
+        try:
+            self.call_after_refresh(do_scroll)
+        except Exception:
+            do_scroll()
+
     def _mount_timeline_message(
         self,
         role: str,
@@ -2175,6 +2496,7 @@ class OrchBridgeApp(App):
     ) -> TimelineMessage:
         message = TimelineMessage(role, text, css_class=css_class)
         self.query_one("#feed", VerticalScroll).mount(message)
+        self._follow_feed_bottom()
         return message
 
     def _mount_user_message(self, prompt: str) -> None:
@@ -3077,9 +3399,31 @@ RESUME RULES:
             self.event("status", f"Task status: {self.task_status}")
             return
 
+        if m := DECISION_RE.match(line):
+            self.router_decision = m.group(1).strip()
+            return
+
+        if m := ROUTE_EXCLUDED_RE.match(line):
+            self.route_excluded = m.group(1).strip()
+            return
+
         if m := ROUTE_RE.match(line):
-            self.route = m.group(1)
+            self.route = m.group(1).strip()
             self.update_banner()
+            source = router_decision_source(self.router_decision)
+            extra: list[str] = []
+            if self.route_excluded:
+                extra.append(f"excluded: {self.route_excluded}")
+            else:
+                cmd_health = self._global_cmd_health_summary()
+                if cmd_health != "HEALTHY":
+                    extra.append(f"CMD excluded: {cmd_health}")
+            self.note(
+                f"source: {source}\n{pretty_router_panel(self.route)}"
+                + (("\n" + "\n".join(extra)) if extra else ""),
+                title="ROUTER",
+                collapsed=False,
+            )
             return
 
         if m := QUOTA_RE.match(line):
@@ -3252,6 +3596,7 @@ RESUME RULES:
             collapsed=True,
         )
         self.query_one("#feed", VerticalScroll).mount(panel)
+        self._follow_feed_bottom()
 
         self.current = Attempt(model=model, panel=panel, log=log)
         self.attempts.append(self.current)
@@ -3301,6 +3646,7 @@ RESUME RULES:
                 "trace": "· ",
             }.get(kind, "")
             self.current.log.write(prefix + text)
+            self._follow_feed_bottom()
 
         self.update_agentdock()
 
@@ -3335,6 +3681,12 @@ RESUME RULES:
             "QUEUE HALTED",
             "QUEUE PAUSED",
             "QUEUE START",
+            "SCHEDULE",
+            "SCHEDULE NOTICE",
+            "SCHEDULE ERROR",
+            "SCHEDULED",
+            "SCHEDULE DUE",
+            "ROUTER",
             "DOCTOR",
             "STEER",
             "STEER WARNING",
@@ -3351,6 +3703,7 @@ RESUME RULES:
             panel = Collapsible(log, title=title, collapsed=collapsed)
             self.query_one("#feed", VerticalScroll).mount(panel)
             log.write(text)
+            self._follow_feed_bottom()
             return
 
         css = "status-message" if title in {
@@ -3424,6 +3777,23 @@ RESUME RULES:
 
         dock.update("  " + "   ·   ".join(parts) if parts else "  AGENTS idle")
 
+    def _global_cmd_health_summary(self) -> str:
+        try:
+            data = json.loads(GLOBAL_PROVIDER_HEALTH_FILE.read_text())
+            item = (data.get("providers") or {}).get("commandcode") or {}
+        except Exception:
+            item = {}
+        if not isinstance(item, dict) or not item:
+            return "HEALTHY"
+        status = str(item.get("status") or "UNKNOWN")
+        reason = str(item.get("reason") or "")
+        try:
+            remain = max(0, int(float(item.get("next_probe_at") or 0) - now()))
+        except Exception:
+            remain = 0
+        retry = f" · auto-probe in ~{max(1, remain // 60)}m" if remain else ""
+        return f"{status} · {reason}{retry}".strip(" ·")
+
     def refresh_cached_quota(self) -> None:
         if now() - self._last_quota_refresh < 5:
             return
@@ -3435,6 +3805,7 @@ RESUME RULES:
         self._poll_delegate_events()
         self._refresh_process_diag()
         self._poll_recovered_main_worker()
+        self._schedule_tick()
         self._queue_tick()
 
         if self.current and self.current.ended is None and self.proc and self.proc.poll() is None:
@@ -3651,6 +4022,28 @@ RESUME RULES:
                 self._registered_project_completion_names(),
                 "프로젝트 선택",
             )
+
+        m = re.match(r"^/project\s+slot\s*(.*)$", stripped, re.I)
+        if m:
+            rest = m.group(1)
+            names = self._registered_project_completion_names()
+            tokens = rest.split()
+            if not tokens or (len(tokens) == 1 and not rest.endswith((" ", "\t"))):
+                return self._argument_completion_rows("/project slot", rest, names, "프로젝트 선택")
+            project = tokens[0]
+            if project.casefold() not in {x.casefold() for x in names}:
+                return self._argument_completion_rows("/project slot", rest, names, "프로젝트 선택")
+            partial = "" if len(tokens) == 1 else tokens[1]
+            slots = ["auto"] + [str(i) for i in range(1, 9)] + [str(i) for i in range(10, 21)]
+            return self._argument_completion_rows(f"/project slot {project}", partial, slots, "슬롯 선택")
+
+        m = re.match(r"^/schedule\s+cancel\s*(.*)$", stripped, re.I)
+        if m:
+            ids = [
+                str(x.get("id") or "") for x in self.schedule_state.get("items", [])
+                if str(x.get("id") or "")
+            ]
+            return self._argument_completion_rows("/schedule cancel", m.group(1), ids, "예약 선택")
 
         m = re.match(r"^/branch\s+(switch|next)\s*(.*)$", stripped, re.I)
         if m:
@@ -4017,6 +4410,41 @@ RESUME RULES:
                     collapsed=False,
                 )
 
+        elif cmd == "/schedule":
+            raw = text[len("/schedule"):].strip()
+            sub = p[1].lower() if len(p) >= 2 else "list"
+            if not raw or sub in {"list", "status"}:
+                self.note(self._schedule_status_text(), title="SCHEDULE", collapsed=False)
+            elif sub == "cancel":
+                if len(p) < 3:
+                    self.note("usage: /schedule cancel <number|schedule-id>", title="HELP", collapsed=False)
+                else:
+                    ok, message = self._schedule_cancel(p[2])
+                    self.note(message, title="SCHEDULE" if ok else "SCHEDULE NOTICE", collapsed=False)
+            elif sub == "clear":
+                removed = self._schedule_clear()
+                self.note(f"cancelled {removed} pending schedules", title="SCHEDULE", collapsed=False)
+            else:
+                try:
+                    due, prompt = parse_schedule_request(raw)
+                    item = self._schedule_add(due, prompt)
+                    self.note(
+                        f"scheduled · {item.get('id')}\n"
+                        f"time: {due.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+                        f"prompt: {prompt}",
+                        title="SCHEDULED", collapsed=False,
+                    )
+                except Exception as exc:
+                    self.note(
+                        f"schedule failed: {exc}\n\n"
+                        "examples:\n"
+                        "/schedule 14:30 check the current result\n"
+                        "/schedule in 30m review the active run\n"
+                        "/schedule tomorrow 09:00 check CI\n"
+                        "/schedule 2026-10-04 18:00 prepare release",
+                        title="SCHEDULE ERROR", collapsed=False,
+                    )
+
         elif cmd == "/verbose":
             if len(p) > 1 and p[1] in {"normal", "verbose", "trace"}:
                 self.verbosity = p[1]
@@ -4153,6 +4581,11 @@ RESUME RULES:
                 query = text.split(None, 2)[2].strip()
                 argv = [str(helper), "delete", query]
                 title = "PROJECT DELETE"
+            elif len(p) >= 4 and p[1].lower() == "slot":
+                query = p[2]
+                value = p[3]
+                argv = [str(helper), "slot", query, value]
+                title = "PROJECT SLOT"
             else:
                 self.note(
                     "usage:\n"
@@ -4163,7 +4596,8 @@ RESUME RULES:
                     "/project root [path]\n"
                     "/project alias <short-name|auto>\n"
                     "/project close [name]\n"
-                    "/project delete <name>   # 목록 등록만 제거; repo/state 보존",
+                    "/project delete <name>   # 목록 등록만 제거; repo/state 보존\n"
+                    "/project slot <name> <number|auto>",
                     title="HELP",
                     collapsed=False,
                 )
@@ -4352,7 +4786,10 @@ RESUME RULES:
                 else:
                     try:
                         ROUTER_STATE_FILE.unlink(missing_ok=True)
+                        GLOBAL_PROVIDER_HEALTH_FILE.unlink(missing_ok=True)
                         self.route = ""
+                        self.router_decision = ""
+                        self.route_excluded = ""
                         self.note(
                             "Router cooldown/failure state cleared. Frontend router setting unchanged.",
                             title="ROUTER",
@@ -4402,7 +4839,8 @@ RESUME RULES:
             decision, route = self._latest_router_lines()
             text_out = (
                 f"decision: {decision or 'not available'}\n"
-                f"route: {pretty_route(route) if route else 'not available'}"
+                f"route:\n{pretty_router_panel(route) if route else 'not available'}\n"
+                f"CMD global: {self._global_cmd_health_summary()}"
             )
             self.note(text_out, title="DECISION", collapsed=False)
 
@@ -4425,7 +4863,8 @@ RESUME RULES:
                 f"scope: {(self.job or {}).get('scope_mode', self.scope_mode)}\n"
                 f"prompt: {str((self.job or {}).get('prompt_sha256', ''))[:8] or '-'}\n"
                 f"detail: {self.verbosity}\n"
-                f"CMD: {self._cmd_quota_summary}"
+                f"CMD quota: {self._cmd_quota_summary}\n"
+                f"CMD global: {self._global_cmd_health_summary()}"
             )
             self.note(text_out, title="STATUS", collapsed=False)
 
