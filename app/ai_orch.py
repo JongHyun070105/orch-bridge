@@ -185,6 +185,36 @@ JUDGE_HEALTH_KEY = "commandcode:judge"
 def save_state() -> None:
     save_json_atomic(ROUTER_STATE, state)
 
+def migrate_legacy_judge_cooldown() -> None:
+    """Repair older state where a micro-judge failure cooled down CMD MAIN."""
+    info = state.get("blocked_until", {}).get("commandcode")
+    if not isinstance(info, dict):
+        return
+    reason = str(info.get("reason") or "").lower()
+    if "judge" not in reason:
+        return
+    now_ts = time.time()
+    try:
+        old_until = float(info.get("until") or 0)
+    except Exception:
+        old_until = 0
+    remaining = max(0.0, old_until - now_ts)
+    judge_until = now_ts + min(remaining, 10 * 60) if remaining else 0
+    if judge_until > now_ts:
+        state["blocked_until"][JUDGE_HEALTH_KEY] = {
+            "until": judge_until,
+            "reason": "migrated legacy judge rate/credit limit",
+            "failure_count": int(info.get("failure_count") or 0),
+        }
+    state["blocked_until"].pop("commandcode", None)
+    state["failures"].pop("commandcode", None)
+    save_state()
+    log("repaired legacy judge cooldown: CMD MAIN unblocked; judge cooldown isolated")
+
+
+migrate_legacy_judge_cooldown()
+
+
 def block_info(key: str) -> dict[str, Any] | None:
     entry = state["blocked_until"].get(key)
     if not isinstance(entry, dict):
