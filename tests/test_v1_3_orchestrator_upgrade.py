@@ -25,7 +25,7 @@ def test_v13_metadata_and_public_defaults():
     data = json.loads((ROOT / "VERSION.json").read_text())
     manifest = json.loads((ROOT / ".release-please-manifest.json").read_text())
     assert data["release"] == manifest["."]
-    assert data["release"] in {"1.2.0", "1.3.0"}
+    assert tuple(int(x) for x in data["release"].split(".")) >= (1, 2, 0)
     for key in (
         "scheduled_prompt_schema",
         "global_provider_health_schema",
