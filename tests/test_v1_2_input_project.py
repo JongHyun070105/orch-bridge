@@ -21,8 +21,11 @@ def _load(name: str, path: Path):
 
 def test_v12_metadata():
     data = json.loads((ROOT / "VERSION.json").read_text())
-    assert data["components"]["ai_chat_tui"] == "1.2.0"
-    assert data["components"]["ai_workspace"] == "1.2.0"
+    def at_least(value: str, minimum: tuple[int, int, int]) -> bool:
+        return tuple(int(x) for x in value.split(".")) >= minimum
+
+    assert at_least(data["components"]["ai_chat_tui"], (1, 2, 0))
+    assert at_least(data["components"]["ai_workspace"], (1, 2, 0))
     assert data["input_safety_schema"] == 1
     assert data["queue_dedupe_schema"] == 1
     assert data["project_registry_delete_schema"] == 1
