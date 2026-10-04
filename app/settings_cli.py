@@ -19,8 +19,8 @@ DEFAULT_MODELS = {
     "gemini_low": "gemini-3.8-flash-low",
     "gemini_medium": "gemini-3.8-flash-medium",
     "gemini_high": "gemini-3.8-flash-high",
-    "claude_sonnet": "sonnet",
-    "claude_opus": "opus",
+    "claude_sonnet": "claude-sonnet-5-5",
+    "claude_opus": "claude-opus-5-5",
     "sonnet": "claude-sonnet-4-6-thinking",
     "opus": "claude-opus-4-6-thinking",
 }
