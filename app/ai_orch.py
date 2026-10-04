@@ -20,6 +20,21 @@ from orch_quality import (
     task_tags,
 )
 from provider_runtime import effective_provider_enabled, resolve_provider_cli
+from provider_health_state import (
+    clear_provider as clear_global_provider,
+    defer_probe as defer_global_probe,
+    mark_quota_exhausted as mark_global_quota_exhausted,
+    probe_due as global_probe_due,
+    provider_status as global_provider_status,
+    provider_unavailable as global_provider_unavailable,
+    summary as global_provider_summary,
+)
+from claude_runtime import (
+    effective_effort as claude_effective_effort,
+    cli_supports_effort as claude_cli_supports_effort,
+    pretty_model as pretty_claude_model,
+    stream_actions as claude_stream_actions,
+)
 
 
 def _quiet_keyboard_interrupt_excepthook(exc_type, exc, tb):
@@ -163,6 +178,9 @@ for k, v in (
     state.setdefault(k, v)
 state.setdefault("last_success", None)
 state.setdefault("last_decision", None)
+state.setdefault("recent_routes", [])
+
+JUDGE_HEALTH_KEY = "commandcode:judge"
 
 def save_state() -> None:
     save_json_atomic(ROUTER_STATE, state)
@@ -203,11 +221,13 @@ def clear_failure(key: str) -> None:
     state["blocked_until"].pop(key, None)
     save_state()
 
-def block_with_backoff(key: str, reason: str, base_seconds: int = 300) -> None:
+def block_with_backoff(
+    key: str, reason: str, base_seconds: int = 300, *, max_seconds: int = 3600
+) -> None:
     count = failure_count(key) + 1
     state["failures"][key] = count
     mults = [1, 3, 6, 12]
-    seconds = min(base_seconds * mults[min(count - 1, len(mults) - 1)], 3600)
+    seconds = min(base_seconds * mults[min(count - 1, len(mults) - 1)], max_seconds)
     state["blocked_until"][key] = {
         "until": time.time() + seconds,
         "reason": reason,
@@ -226,12 +246,21 @@ def block_until(key: str, until: float, reason: str) -> None:
     log(f"{key} blocked until reset ({fmt_duration(until-time.time())}; {reason})")
 
 def record_success(backend: str, model: str | None, pool: str | None) -> None:
-    state["last_success"] = {
+    if backend == "commandcode":
+        clear_global_provider("commandcode", source="main_success")
+    event = {
         "backend": backend,
         "model": model,
         "pool": pool,
         "at": time.time(),
     }
+    state["last_success"] = event
+    recent = state.setdefault("recent_routes", [])
+    if not isinstance(recent, list):
+        recent = []
+        state["recent_routes"] = recent
+    recent.append(event)
+    del recent[:-12]
     clear_failure(backend)
     if pool:
         clear_failure(f"{backend}:{pool}")
@@ -330,15 +359,64 @@ def parse_cmd_ndjson(stdout: str) -> tuple[str, dict[str, Any] | None]:
             final_text = str(obj.get("finalText", ""))
     return final_text, result_obj
 
+def maybe_probe_commandcode_quota() -> None:
+    """Probe an exhausted Command Code account at most once per backoff window."""
+    if not global_provider_unavailable("commandcode") or not global_probe_due("commandcode"):
+        return
+    exe = resolve_provider_cli("commandcode", config)
+    if not exe:
+        defer_global_probe("commandcode", 3600, reason="Command Code executable unavailable")
+        return
+    model = config.get("decision", {}).get("judge_model", "xiaomi/mimo-v2.5-pro")
+    argv = [
+        exe, "-p", "Reply exactly OK. Provider availability probe.",
+        "--plan", "--skip-onboarding", "--output-format", "json",
+        "--max-turns", "1", "-m", model,
+    ]
+    try:
+        r = subprocess.run(argv, cwd=repo, capture_output=True, text=True, timeout=45)
+    except Exception as e:
+        defer_global_probe("commandcode", 1800, reason=f"probe error: {e}")
+        return
+    combined = (r.stdout or "") + "\n" + (r.stderr or "")
+    credit_re = re.compile(
+        r"insufficient credits|credit limit|credits? exhausted|quota exhausted|out of credits|no credits",
+        re.I,
+    )
+    if r.returncode == 0:
+        clear_global_provider("commandcode", source="automatic_probe_success")
+        clear_failure("commandcode")
+        clear_failure(JUDGE_HEALTH_KEY)
+        log("Command Code availability probe only (not MAIN routing): succeeded; global CMD availability restored")
+    elif r.returncode == 10 or credit_re.search(combined):
+        mark_global_quota_exhausted(
+            "commandcode",
+            reason="credit/quota exhausted",
+            source="automatic_probe",
+            detail=combined,
+            retry_after_seconds=3600,
+        )
+        log("Command Code availability probe only (not MAIN routing): still QUOTA_EXHAUSTED")
+    elif r.returncode == 5:
+        defer_global_probe("commandcode", 900, reason="probe rate limited")
+    else:
+        defer_global_probe("commandcode", 1800, reason=f"probe exit={r.returncode}")
+
+
 def microjudge_assessment(text: str) -> Assessment | None:
     dcfg = config.get("decision", {})
+    maybe_probe_commandcode_quota()
     if not dcfg.get("enabled", True) or is_casual(text):
+        return None
+    if global_provider_unavailable("commandcode"):
+        log(f"skip decision micro-judge: Command Code {global_provider_summary('commandcode')}")
+        return None
+    if blocked(JUDGE_HEALTH_KEY):
+        log_blocked("decision micro-judge", JUDGE_HEALTH_KEY)
         return None
 
     model = dcfg.get("judge_model", "xiaomi/mimo-v2.5-pro")
-    effort = dcfg.get("judge_effort", "low")
     timeout = int(dcfg.get("judge_timeout_seconds", 75))
-
     prompt = f"""Assess the CURRENT user task for an AI coding/research orchestrator.
 Do NOT solve the task. Return JSON only, no markdown.
 
@@ -356,12 +434,6 @@ Return exactly:
 }}
 
 All numbers are 0.0-1.0.
-reasoning: depth of reasoning needed.
-uncertainty: likelihood hidden complexity appears after inspection.
-scope: breadth/files/subsystems likely involved.
-risk: consequences of a wrong answer/action.
-crosscheck: value of an independent second model.
-write_likelihood: likelihood the task requires modifying files.
 """
     judge_exe = resolve_provider_cli("commandcode", config)
     if not judge_exe:
@@ -375,19 +447,30 @@ write_likelihood: likelihood the task requires modifying files.
         "-m", model,
     ]
     try:
-        r = subprocess.run(
-            cmd, cwd=repo, capture_output=True, text=True, timeout=timeout,
-        )
+        r = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout)
     except Exception as e:
         log(f"decision micro-judge unavailable: {e}")
         return None
 
-    if r.returncode in (5, 10):
-        block_with_backoff(
+    combined = (r.stdout or "") + "\n" + (r.stderr or "")
+    credit_re = re.compile(
+        r"insufficient credits|credit limit|credits? exhausted|quota exhausted|out of credits|no credits",
+        re.I,
+    )
+    if r.returncode == 10 or credit_re.search(combined):
+        mark_global_quota_exhausted(
             "commandcode",
-            "judge rate/credit limit",
-            900 if r.returncode == 5 else 1800,
+            reason="credit/quota exhausted",
+            source="decision_judge",
+            detail=combined,
+            retry_after_seconds=3600,
         )
+        clear_failure(JUDGE_HEALTH_KEY)
+        log("Command Code quota exhausted globally; CMD MAIN/judge/delegates disabled and router will fall back")
+        return None
+    if r.returncode == 5:
+        block_with_backoff(JUDGE_HEALTH_KEY, "judge rate limit", 120, max_seconds=600)
+        log("decision micro-judge rate limited; falling back locally without blocking CMD MAIN")
         return None
     if r.returncode != 0:
         log(f"decision micro-judge failed: exit={r.returncode}")
@@ -396,7 +479,6 @@ write_likelihood: likelihood the task requires modifying files.
     final, _ = parse_cmd_ndjson(r.stdout)
     if not final:
         final = r.stdout.strip()
-
     m = re.search(r"\{.*\}", final, re.S)
     if not m:
         return None
@@ -404,7 +486,7 @@ write_likelihood: likelihood the task requires modifying files.
         obj = json.loads(m.group(0))
     except Exception:
         return None
-
+    clear_failure(JUDGE_HEALTH_KEY)
     return Assessment(
         clamp(obj.get("reasoning")),
         clamp(obj.get("uncertainty")),
@@ -501,6 +583,9 @@ class Candidate:
     utility: float = -999.0
     quality_adjustment: float = 0.0
     quality_observations: int = 0
+    availability: float = 0.0
+    recent_penalty: float = 0.0
+    score_components: dict[str, float] | None = None
 
 def quota_availability(pool: str | None, q: float | None, reset_in: float | None) -> float:
     if pool is None:
@@ -510,17 +595,37 @@ def quota_availability(pool: str | None, q: float | None, reset_in: float | None
         0.10,
     ))
     reset_soon = float(routing_cfg.get("reset_soon_seconds", 3600))
-
     if q is None:
-        return 0.38 if pool == "gemini" else 0.58
-
+        if pool == "gemini":
+            return 0.38
+        if pool == "claude-pro":
+            return 0.66
+        return 0.58
     if q < reserve:
         if reset_in is not None and reset_in <= reset_soon:
             return min(0.85, 0.55 + 0.30 * (1 - reset_in / max(reset_soon, 1)))
         return max(0.05, 0.25 * q / max(reserve, 0.001))
-
     bonus = 0.15 if reset_in is not None and reset_in <= reset_soon else 0.0
     return min(1.0, 0.35 + 0.65 * q + bonus)
+
+CLAUDE_CODE_PINNED_MODELS = {
+    "sonnet": "claude-sonnet-5-5",
+    "opus": "claude-opus-5-5",
+}
+
+def claude_code_model(family: str, configured: Any = None) -> str:
+    family = str(family).strip().lower()
+    raw = str(configured or "").strip()
+    lo = raw.lower()
+    if not raw:
+        return CLAUDE_CODE_PINNED_MODELS[family]
+    legacy = {
+        "sonnet": {"sonnet", "claude-sonnet-5", "claude-sonnet-5-0"},
+        "opus": {"opus", "claude-opus-5", "claude-opus-5-0"},
+    }
+    if lo in legacy.get(family, set()):
+        return CLAUDE_CODE_PINNED_MODELS[family]
+    return raw
 
 candidates = [
     Candidate("cmd", "Command Code", "commandcode", "xiaomi",
@@ -534,15 +639,15 @@ candidates = [
     Candidate("gemini-high", "AGY/Gemini 3.8 Flash High", "agy", "google",
               models.get("gemini_high", "gemini-3.8-flash-high"),
               "gemini", .80, .29, gemini_q, gemini_reset),
-    Candidate("claude-sonnet", "Claude Code/Sonnet (Pro)", "claude", "anthropic",
-              models.get("claude_sonnet", "sonnet"),
+    Candidate("claude-sonnet", "Claude Code/Sonnet 5.5 (subscription)", "claude", "anthropic",
+              claude_code_model("sonnet", models.get("claude_sonnet")),
               "claude-pro", .95, .46),
     Candidate("sonnet", "AGY/Sonnet 4.6 Thinking", "agy", "anthropic",
               models.get("sonnet", "claude-sonnet-4-6-thinking"),
               "third", .94, .50, third_q, third_reset),
     Candidate("codex", "Codex", "codex", "openai", None, None, .93, .62),
-    Candidate("claude-opus", "Claude Code/Opus (Pro)", "claude", "anthropic",
-              models.get("claude_opus", "opus"),
+    Candidate("claude-opus", "Claude Code/Opus 5.5 (subscription)", "claude", "anthropic",
+              claude_code_model("opus", models.get("claude_opus")),
               "claude-pro", .99, .90),
     Candidate("opus", "AGY/Opus 4.6 Thinking", "agy", "anthropic",
               models.get("opus", "claude-opus-4-6-thinking"),
@@ -559,19 +664,79 @@ force_alias = {
     "codex": "codex", "opus": "opus",
 }
 
+def route_utility(
+    *, need: float, capability: float, cost: float, availability: float,
+    risk: float, crosscheck: float, recent_penalty: float = 0.0,
+) -> tuple[float, dict[str, float]]:
+    need = clamp(need)
+    capability = clamp(capability)
+    availability = clamp(availability)
+    under = max(0.0, need - capability)
+    over = max(0.0, capability - need)
+    difficulty = max(0.0, min(1.0, (need - 0.55) / 0.45))
+    cost_weight = 0.30 * (1.0 - 0.78 * need)
+    over_weight = 0.22 * (1.0 - need)
+    capability_bonus = 0.78 * need * capability
+    if capability >= 0.90:
+        capability_bonus += 0.32 * difficulty
+    components = {
+        "under": -4.30 * under,
+        "over": -over_weight * over,
+        "availability": 0.45 * availability,
+        "cost": -cost_weight * cost,
+        "capability": capability_bonus,
+        "risk_floor": -0.75 if risk > 0.65 and capability < 0.80 else 0.0,
+        "crosscheck_floor": -0.40 if crosscheck > 0.80 and capability < 0.75 else 0.0,
+        "recent": recent_penalty,
+    }
+    return 0.76 + sum(components.values()), components
+
+def recent_route_penalty(c: Candidate) -> float:
+    recent = state.get("recent_routes")
+    if not isinstance(recent, list):
+        return 0.0
+    target_hits = backend_hits = pool_hits = 0
+    for item in recent[-8:]:
+        if not isinstance(item, dict):
+            continue
+        if item.get("backend") == c.backend:
+            backend_hits += 1
+        if item.get("model") == c.model:
+            target_hits += 1
+        if c.pool and item.get("pool") == c.pool:
+            pool_hits += 1
+    return max(-0.18, -(0.030 * target_hits + 0.012 * backend_hits + 0.008 * pool_hits))
+
+def collaboration_requirement(
+    need: float, scope: float, uncertainty: float, crosscheck: float, strict: bool
+) -> str:
+    if strict:
+        if need >= 0.58 and (scope >= 0.42 or uncertainty >= 0.50 or crosscheck >= 0.52):
+            return "delegate"
+        return "optional"
+    if need >= 0.74 or (scope >= 0.68 and uncertainty >= 0.62) or crosscheck >= 0.80:
+        return "parallel"
+    if need >= 0.48 and (scope >= 0.38 or uncertainty >= 0.45 or crosscheck >= 0.48):
+        return "delegate"
+    return "optional"
+
 def candidate_blocked(c: Candidate) -> bool:
+    if c.backend == "commandcode" and global_provider_unavailable("commandcode"):
+        return True
     if not provider_enabled(c.backend):
         return True
     if blocked(c.backend):
         return True
     if c.backend == "claude":
-        ready, reason = claude_subscription_ready()
+        ready, _ = claude_subscription_ready()
         if not ready:
             return True
         if c.pool and blocked(f"claude:{c.pool}"):
             return True
         return False
     if c.backend == "agy" and blocked("agy"):
+        return True
+    if c.backend == "agy" and blocked(f"agy:model:{c.key}"):
         return True
     if c.backend == "agy" and c.pool and blocked(f"agy:{c.pool}"):
         return True
@@ -598,34 +763,14 @@ for c in candidates:
     if candidate_blocked(c):
         c.utility = -100
         continue
-
-    avail = quota_availability(c.pool, c.quota, c.reset_in)
-    under = max(0.0, need - c.capability)
-    over = max(0.0, c.capability - need)
-
-    # Prefer the least expensive model that is comfortably sufficient.
-    u = (
-        1.10
-        - 3.6 * under
-        - 0.42 * over
-        + 0.62 * avail
-        - 0.38 * c.cost
+    c.availability = quota_availability(c.pool, c.quota, c.reset_in)
+    c.recent_penalty = recent_route_penalty(c)
+    u, components = route_utility(
+        need=need, capability=c.capability, cost=c.cost, availability=c.availability,
+        risk=assessment.risk, crosscheck=assessment.crosscheck,
+        recent_penalty=c.recent_penalty,
     )
-
-    if last:
-        if last.get("backend") == c.backend:
-            u += 0.05
-        if last.get("model") == c.model:
-            u += 0.08
-        if c.pool and last.get("pool") == c.pool:
-            u += 0.04
-
-    # High-risk work should not be routed to a weak candidate merely because it is cheap.
-    if assessment.risk > .65 and c.capability < .80:
-        u -= .70
-    if assessment.crosscheck > .80 and c.capability < .75:
-        u -= .35
-
+    c.score_components = components
     if quality_enabled:
         qadj, qmeta = router_learning_adjustment(
             ROUTER_LEARNING,
@@ -637,20 +782,44 @@ for c in candidates:
         c.quality_adjustment = qadj
         c.quality_observations = int(qmeta.get("observations") or 0)
         u += qadj
-
     c.utility = u
 
 if not (force and force != "auto" and force_alias.get(force)):
     candidates.sort(key=lambda c: c.utility, reverse=True)
 
-log("route: " + " > ".join(
-    f"{c.key}({c.utility:.2f}"
-    f"{',q%+.2f' % c.quality_adjustment if c.quality_adjustment else ''})"
-    for c in candidates[:5]
+if global_provider_unavailable("commandcode"):
+    log(f"Command Code global status: {global_provider_summary('commandcode')} · auto fallback active")
+viable_ranked = [c for c in candidates if c.utility > -99]
+log("route utility (not raw model quality): " + " > ".join(
+    f"{c.key}(u={c.utility:.2f},cap={c.capability:.2f},avail={c.availability:.2f}"
+    f",recent={c.recent_penalty:+.2f}"
+    f"{',learn=%+.2f' % c.quality_adjustment if c.quality_adjustment else ''})"
+    for c in viable_ranked[:7]
 ))
+if global_provider_unavailable("commandcode"):
+    log(f"route excluded: cmd({global_provider_summary('commandcode')})")
 
 def orchestrator_prompt(main_name: str, original_task: str, prior: str | None = None) -> str:
     prior_section = ""
+    strict = str(os.environ.get("AI_ORCH_STRICT_TASK", "0")) == "1"
+    collaboration = collaboration_requirement(
+        assessment.need, assessment.scope, assessment.uncertainty, assessment.crosscheck, strict
+    )
+    if collaboration == "parallel":
+        collaboration_policy = (
+            "COLLABORATION REQUIRED: early enough to affect your plan, use orch-parallel with 2 distinct "
+            "healthy cross-provider workers for independently checkable review/research subtasks, unless no "
+            "healthy/quota-viable target exists. Collect and synthesize the results."
+        )
+    elif collaboration == "delegate":
+        collaboration_policy = (
+            "COLLABORATION REQUIRED: proactively use at least one bounded orch-delegate or orch-consult "
+            "early enough to affect the plan when a healthy target exists."
+        )
+    else:
+        collaboration_policy = (
+            "COLLABORATION OPTIONAL: use a delegate/consult only when it materially improves correctness."
+        )
     if prior:
         prior_section = f"""
 PRIOR LOWER-TIER RESULT TO VERIFY:
@@ -681,6 +850,7 @@ LOCAL EXECUTION PERMISSIONS:
 - Branch autonomy is enabled for MAIN. Prefer `orch-branch status|list|switch|new|back` for branch lifecycle changes. You may create a task branch or switch to an existing clean branch when that materially improves isolation or matches the task.
 - Record important branch changes in your progress/final report; do not silently strand work on an unexpected branch.
 - In guarded mode, take only clearly necessary local actions and avoid optional mutations.
+- {collaboration_policy}
 - These permissions do NOT authorize destructive Git (`reset --hard`, `clean`, branch deletion), force-push, automatic merge/push, credential changes, purchases, private/live trading, or destructive/high-impact cloud/AWS operations. Those retain the existing explicit user/GO gates.
 
 Safety:
@@ -790,9 +960,9 @@ def _redact_progress(value: Any) -> str:
 def _model_progress_label(model: str | None, backend: str) -> str:
     m = (model or "").lower()
     if backend == "claude" and "opus" in m:
-        return "Claude-Pro/Opus"
+        return "Claude Code/Opus"
     if backend == "claude":
-        return "Claude-Pro/Sonnet"
+        return "Claude Code/Sonnet"
     if "sonnet" in m:
         return "Sonnet"
     if "opus" in m:
@@ -1196,17 +1366,26 @@ def run_claude(prompt: str, model: str) -> Outcome:
     exe = resolve_provider_cli("claude", config)
     if not exe:
         return _missing_cli_outcome("claude")
+
+    effort, effort_source = claude_effective_effort(
+        model,
+        need=assessment.need,
+        reasoning=assessment.reasoning,
+        uncertainty=assessment.uncertainty,
+        scope=assessment.scope,
+        risk=assessment.risk,
+        crosscheck=assessment.crosscheck,
+    )
     argv = [
-        exe, "-p",
-        "--model", model,
-        "--output-format", "stream-json",
-        "--verbose",
-        "--dangerously-skip-permissions",
+        exe, "-p", "--model", model, "--output-format", "stream-json",
+        "--verbose", "--dangerously-skip-permissions",
     ]
+    if effort and claude_cli_supports_effort(exe):
+        argv.extend(["--effort", effort])
     env = claude_subscription_env()
     proc = subprocess.Popen(
-        argv, cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1,
+        argv, cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, bufsize=1,
     )
     assert proc.stdin is not None
     proc.stdin.write(prompt)
@@ -1214,7 +1393,8 @@ def run_claude(prompt: str, model: str) -> Outcome:
     stderr_parts: list[str] = []
     final = ""
     result_obj: dict[str, Any] | None = None
-    pending_narration = ""
+    last_progress = ""
+    seen_tools: set[str] = set()
 
     def read_err() -> None:
         assert proc.stderr is not None
@@ -1229,19 +1409,35 @@ def run_claude(prompt: str, model: str) -> Outcome:
             obj = json.loads(line)
         except Exception:
             continue
+        for action in claude_stream_actions(obj):
+            kind = action.get("kind")
+            if kind == "init":
+                actual = str(action.get("model") or model)
+                effort_label = effort or "Claude Code default"
+                log(
+                    f"[{label}] started · model={actual} · effort={effort_label}"
+                    f" · effort_source={effort_source} · auth=Claude.ai subscription"
+                )
+            elif kind == "reasoning":
+                log(f"[{label}] reasoning…")
+            elif kind == "text":
+                text = str(action.get("text") or "").strip()
+                if text and text != last_progress:
+                    _emit_visible_progress(label, text)
+                    last_progress = text
+            elif kind == "tool":
+                name = str(action.get("name") or "tool")
+                tid = str(action.get("id") or "")
+                key = tid or f"{name}:{_redact_progress(action.get('input'))}"
+                if key not in seen_tools:
+                    detail = _redact_progress(action.get("input"))
+                    log(f"[{label} tool] {name}" + (f": {detail}" if detail and detail not in ("{}", "None") else ""))
+                    seen_tools.add(key)
+            elif kind == "tool_result" and action.get("is_error"):
+                log(f"[{label} tool] result: error")
+
         etype = obj.get("type")
-        if etype == "system" and obj.get("subtype") == "init":
-            actual = obj.get("model") or model
-            log(f"[{label}] started · model={actual}")
-        elif etype == "assistant":
-            message = obj.get("message", {}) if isinstance(obj.get("message"), dict) else {}
-            content = message.get("content", []) if isinstance(message.get("content"), list) else []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = str(block.get("text") or "")
-                    if text:
-                        pending_narration = text
-        elif etype == "rate_limit_event":
+        if etype == "rate_limit_event":
             _save_claude_usage_event(obj)
         elif etype == "result":
             result_obj = obj
@@ -1250,14 +1446,12 @@ def run_claude(prompt: str, model: str) -> Outcome:
     rc = proc.wait()
     t.join(timeout=1)
     stderr = "".join(stderr_parts)
-    if pending_narration.strip() and not final:
-        final = pending_narration.strip()
-
+    if last_progress and not final:
+        final = last_progress
     subtype = str((result_obj or {}).get("subtype") or "")
     is_error = bool((result_obj or {}).get("is_error"))
     if rc == 0 and result_obj and subtype == "success" and not is_error and final:
         return Outcome(True, final, "success")
-
     combined = stderr + "\n" + json.dumps(result_obj or {}, ensure_ascii=False)
     if RATE_LIMIT_RE.search(combined) or re.search(r"usage limit|rate.?limit|quota|try again", combined, re.I):
         return Outcome(False, "", "rate_limit", combined)
@@ -1544,7 +1738,17 @@ def handle_failure(c: Candidate, outcome: Outcome) -> bool:
         if outcome.kind == "rate_limit":
             block_with_backoff("commandcode", "rate limit", 900)
         elif outcome.kind == "credits":
-            block_with_backoff("commandcode", "insufficient credits", 1800)
+            mark_global_quota_exhausted(
+                "commandcode",
+                reason="credit/quota exhausted",
+                source="main",
+                detail=detail,
+                retry_after_seconds=3600,
+            )
+            state["blocked_until"].pop("commandcode", None)
+            state["failures"].pop("commandcode", None)
+            save_state()
+            log("Command Code marked QUOTA_EXHAUSTED globally; falling back to other providers")
         else:
             block_with_backoff("commandcode", "agent failure", 300)
         return False
@@ -1574,7 +1778,7 @@ def handle_failure(c: Candidate, outcome: Outcome) -> bool:
         else:
             block_with_backoff(key, "quota/rate limit", 900)
     else:
-        block_with_backoff(f"agy:{c.pool}", "model-specific failure", 300)
+        block_with_backoff(f"agy:model:{c.key}", "model-specific failure", 300)
     return False
 
 def uncertainty_signal(text: str) -> bool:
@@ -1633,8 +1837,11 @@ for c in candidates:
             else:
                 log_blocked(c.label, "claude")
         else:
+            model_key = f"agy:model:{c.key}"
             log_blocked(c.label, "agy" if c.backend == "agy" and blocked("agy") else (
-                f"agy:{c.pool}" if c.backend == "agy" and c.pool and blocked(f"agy:{c.pool}") else c.backend
+                model_key if c.backend == "agy" and blocked(model_key) else (
+                    f"agy:{c.pool}" if c.backend == "agy" and c.pool and blocked(f"agy:{c.pool}") else c.backend
+                )
             ))
         continue
     if skip_agy and c.backend == "agy":
