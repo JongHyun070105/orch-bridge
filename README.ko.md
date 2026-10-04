@@ -89,7 +89,7 @@ Gemini 모델은 기존 AGY provider 경로를 통해 사용할 수 있습니다
 
 ### Release asset
 
-[v1.3.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.3.0)에서 `orchbridge-v1.2.0.sh`를 내려받아 실행합니다.
+[v1.3.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.3.0)에서 `orchbridge-v1.3.0.sh`를 내려받아 실행합니다.
 
 ```bash
 bash orchbridge-v1.3.0.sh
@@ -185,7 +185,6 @@ orch settings provider commandcode auto
 
 orch settings model claude_sonnet claude-sonnet-5-5
 orch settings model claude_opus claude-opus-5-5
-orch settings model claude_opus opus
 orch settings model commandcode xiaomi/mimo-v2.5-pro
 orch settings model gemini_high gemini-3.8-flash-high
 ```
