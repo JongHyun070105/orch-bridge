@@ -1645,6 +1645,16 @@ def delegate(args: argparse.Namespace) -> int:
     if not caller:
         raise SystemExit("--caller is required when AI_ORCH_MAIN_MODEL is not set")
 
+    if args.task_file:
+        task = Path(args.task_file).read_text()
+    elif args.task is not None:
+        task = args.task
+    else:
+        task = sys.stdin.read()
+
+    if not task.strip():
+        raise SystemExit("delegated task is empty")
+
     if requested_target == "auto":
         try:
             target = _auto_target(caller, task)
@@ -1685,16 +1695,6 @@ def delegate(args: argparse.Namespace) -> int:
         )
         print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
         return 26
-
-    if args.task_file:
-        task = Path(args.task_file).read_text()
-    elif args.task is not None:
-        task = args.task
-    else:
-        task = sys.stdin.read()
-
-    if not task.strip():
-        raise SystemExit("delegated task is empty")
 
     repo = _repo_root(Path(args.repo or os.getcwd()))
     base_snapshot = _repo_snapshot(repo)
