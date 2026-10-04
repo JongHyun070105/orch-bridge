@@ -2,6 +2,13 @@
 
 All notable changes to OrchBridge are documented here.
 
+## [1.3.0](https://github.com/JongHyun070105/orch-bridge/compare/v1.2.0...v1.3.0) (2026-10-04)
+
+
+### Features
+
+* release OrchBridge v1.3 orchestrator upgrade ([2f37d26](https://github.com/JongHyun070105/orch-bridge/commit/2f37d2610b84aed1c41c2efdbcbbca22ee0f907c))
+
 ## [1.2.0](https://github.com/JongHyun070105/orch-bridge/compare/v1.1.0...v1.2.0) (2026-09-30)
 
 
