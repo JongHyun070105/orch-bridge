@@ -55,7 +55,7 @@ Most coding-agent CLIs are excellent on their own, but real work often needs mor
 - **Global provider health fallback** so exhausted Command Code credit is excluded from MAIN/judge/delegate routing until a bounded recovery probe succeeds
 - **Role-aware proactive collaboration** that favors independent reviewers/researchers and does not spend useful delegate budget on provider-level blocked calls
 - **Claude Code 5.5 defaults + adaptive effort** with visible progress/tool activity but no hidden chain-of-thought exposure
-- **Visible ranked router utility** including exclusion reasons, quota availability, capability, and recent-use penalties
+- **Visible ranked router utility** with compact final scores and exclusion reasons
 - **Project slot pin/auto controls** plus live-window compaction and transcript auto-follow
 - **Textual TUI** with a working `Ctrl+P` command palette
 - **Portable settings CLI**: `orch settings`

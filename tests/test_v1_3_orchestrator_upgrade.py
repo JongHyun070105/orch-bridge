@@ -153,14 +153,18 @@ def test_router_visibility_and_cmd_exclusion_surfaces():
     mod = _load("tui_v13_router", APP / "ai_chat_tui.py")
     m = mod.ROUTE_RE.match(
         "[ai-orch] route utility (not raw model quality): "
-        "claude-sonnet(u=1.68,cap=0.95,avail=0.66,recent=-0.03) > "
-        "gemini-high(u=1.43,cap=0.80,avail=0.90,recent=+0.00)"
+        "claude-sonnet(1.68) > "
+        "gemini-high(1.43)"
     )
     assert m
     panel = mod.pretty_router_panel(m.group(1))
-    assert "Claude Code Sonnet 5.5" in panel
-    assert "Gemini 3.8 Flash" in panel
+    assert "Claude Code Sonnet 5.5 (1.68)" in panel
+    assert "Gemini 3.8 Flash · high (1.43)" in panel
+    assert "subscription" not in panel.lower()
     assert "GLOBAL_PROVIDER_HEALTH_FILE" in tui
+    assert "elif m := ROUTE_RE.match(line):" in tui
+    assert 'if not provider_config_enabled(config, "commandcode"):' in orch
+    assert orch.index('global_probe_due("commandcode")') < orch.index('provider_config_enabled(config, "commandcode")')
 
 
 def test_transcript_follow_and_project_slot_surfaces():

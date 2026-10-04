@@ -49,7 +49,7 @@ OrchBridge는 로컬에 설치되고 인증된 provider CLI를 사용하며, 모
 - review/research/implementation 역할과 최근 사용량을 반영하는 **능동적 delegate 선택**
 - **Claude Code Sonnet/Opus 5.5 기본값 + 작업 난이도별 adaptive effort**
 - 내부 chain-of-thought는 노출하지 않으면서 text/tool 진행상황을 보여주는 **Claude Code 진행 표시**
-- 실제 utility/capability/availability/recent penalty와 제외 사유를 보여주는 **라우터 점수 패널**
+- 최종 utility 점수와 제외 사유를 간결하게 보여주는 **라우터 점수 패널**
 - 번호를 직접 고정하거나 자동 관리할 수 있는 **프로젝트 slot pin/auto + live compact**
 - 새 메시지/진행 이벤트를 따라가는 **채팅 자동 하단 follow**
 - `Ctrl+P` command palette를 지원하는 **Textual TUI**

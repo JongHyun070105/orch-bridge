@@ -494,9 +494,9 @@ def _codex_display_name() -> str:
 def pretty_model_name(raw: str) -> str:
     lo = raw.lower()
     if "claude code/opus" in lo or "claude-pro/opus" in lo:
-        return "Claude Code Opus 5.5 · subscription"
+        return "Claude Code Opus 5.5"
     if "claude code/sonnet" in lo or "claude-pro/sonnet" in lo:
-        return "Claude Code Sonnet 5.5 · subscription"
+        return "Claude Code Sonnet 5.5"
     if lo.strip() == "codex" or lo.startswith("codex "):
         return _codex_display_name()
     m = re.search(r"\(([^()]+)\)\s*$", raw)
@@ -515,8 +515,8 @@ def pretty_model_name(raw: str) -> str:
 def pretty_route(route: str) -> str:
     mapping = {
         "codex": _codex_display_name(),
-        "claude-sonnet": "Claude Code Sonnet 5.5 · subscription",
-        "claude-opus": "Claude Code Opus 5.5 · subscription",
+        "claude-sonnet": "Claude Code Sonnet 5.5",
+        "claude-opus": "Claude Code Opus 5.5",
         "sonnet": "AGY Claude Sonnet 4.6 Thinking",
         "opus": "AGY Claude Opus 4.6 Thinking",
         "gemini-high": "Gemini 3.8 Flash · high",
@@ -526,7 +526,7 @@ def pretty_route(route: str) -> str:
     }
     out = route
     for key, label in mapping.items():
-        out = re.sub(rf"\b{re.escape(key)}(?=\()", label, out)
+        out = re.sub(rf"\b{re.escape(key)}(?=\()", label + " ", out)
     return out
 
 
@@ -2234,10 +2234,10 @@ class OrchBridgeApp(App):
                     for row in p.read_text().splitlines()[-1200:]:
                         ev = json.loads(row)
                         line = str(ev.get("line", ""))
-                        if "[ai-orch] decision:" in line:
-                            decision = line.split("[ai-orch] decision:", 1)[1].strip()
-                        elif "[ai-orch] route:" in line:
-                            route = line.split("[ai-orch] route:", 1)[1].strip()
+                        if m := DECISION_RE.match(line):
+                            decision = m.group(1).strip()
+                        elif m := ROUTE_RE.match(line):
+                            route = m.group(1).strip()
                 except Exception:
                     pass
         return decision, route

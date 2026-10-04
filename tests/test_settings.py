@@ -51,3 +51,18 @@ def test_legacy_claude_aliases_migrate_but_custom_ids_are_preserved(tmp_path, mo
     assert loaded['models']['claude_opus']=='my-custom-opus'
     saved=json.loads(config_path.read_text())
     assert saved['models']==loaded['models']
+
+
+def test_missing_claude_defaults_are_persisted(tmp_path, monkeypatch):
+    config_dir=tmp_path/'.config/orchbridge'
+    config_path=config_dir/'config.json'
+    config_dir.mkdir(parents=True)
+    config_path.write_text(json.dumps({'schema_version':1,'models':{}}))
+    monkeypatch.setattr(m,'CONFIG_DIR',config_dir)
+    monkeypatch.setattr(m,'CONFIG_PATH',config_path)
+    loaded=m.ensure_config()
+    assert loaded['models']['claude_sonnet']=='claude-sonnet-5-5'
+    assert loaded['models']['claude_opus']=='claude-opus-5-5'
+    saved=json.loads(config_path.read_text())
+    assert saved['models']['claude_sonnet']=='claude-sonnet-5-5'
+    assert saved['models']['claude_opus']=='claude-opus-5-5'
