@@ -163,7 +163,8 @@ def test_router_visibility_and_cmd_exclusion_surfaces():
     assert "subscription" not in panel.lower()
     assert "GLOBAL_PROVIDER_HEALTH_FILE" in tui
     assert "elif m := ROUTE_RE.match(line):" in tui
-    assert 'if not effective_provider_enabled(config, "commandcode"):' in orch
+    assert 'if not provider_config_enabled(config, "commandcode"):' in orch
+    assert orch.index('global_probe_due("commandcode")') < orch.index('provider_config_enabled(config, "commandcode")')
 
 
 def test_transcript_follow_and_project_slot_surfaces():
