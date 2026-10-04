@@ -19,7 +19,7 @@ from orch_quality import (
     router_learning_adjustment,
     task_tags,
 )
-from provider_runtime import effective_provider_enabled, resolve_provider_cli
+from provider_runtime import effective_provider_enabled, provider_config_enabled, resolve_provider_cli
 from provider_health_state import (
     clear_provider as clear_global_provider,
     defer_probe as defer_global_probe,
@@ -391,9 +391,9 @@ def parse_cmd_ndjson(stdout: str) -> tuple[str, dict[str, Any] | None]:
 
 def maybe_probe_commandcode_quota() -> None:
     """Probe an exhausted Command Code account at most once per backoff window."""
-    if not effective_provider_enabled(config, "commandcode"):
-        return
     if not global_provider_unavailable("commandcode") or not global_probe_due("commandcode"):
+        return
+    if not provider_config_enabled(config, "commandcode"):
         return
     exe = resolve_provider_cli("commandcode", config)
     if not exe:
