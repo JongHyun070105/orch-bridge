@@ -120,7 +120,7 @@ OrchBridge does **not** install or store credentials for these providers. Each p
 
 ### Release asset
 
-Download `orchbridge-v1.2.0.sh` from the [v1.2.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.2.0), or fetch it directly:
+Download `orchbridge-v1.3.0.sh` from the [v1.3.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.3.0), or fetch it directly:
 
 ```bash
 bash orchbridge-v1.3.0.sh
@@ -206,8 +206,8 @@ orch settings provider claude on
 orch settings provider agy off
 orch settings provider commandcode auto
 
-orch settings model claude_sonnet sonnet
-orch settings model claude_opus opus
+orch settings model claude_sonnet claude-sonnet-5-5
+orch settings model claude_opus claude-opus-5-5
 orch settings model commandcode xiaomi/mimo-v2.5-pro
 orch settings model gemini_high gemini-3.8-flash-high
 ```
