@@ -2,6 +2,17 @@
 
 All notable changes to OrchBridge are documented here.
 
+## [1.3.1](https://github.com/JongHyun070105/orch-bridge/compare/v1.3.0...v1.3.1) (2026-10-04)
+
+
+### Bug Fixes
+
+* address v1.3 review feedback and compact router UI ([6c10ff3](https://github.com/JongHyun070105/orch-bridge/commit/6c10ff3416c78a1baa73be380c433c5d5050850d))
+* address v1.3 review feedback and compact router UI ([6c10ff3](https://github.com/JongHyun070105/orch-bridge/commit/6c10ff3416c78a1baa73be380c433c5d5050850d))
+* address v1.3 review feedback and compact router UI ([a5f1ca1](https://github.com/JongHyun070105/orch-bridge/commit/a5f1ca1a46e4997a4933823fd25c0bb60729b3fd))
+* defer commandcode resolution until quota probe is due ([06a6a20](https://github.com/JongHyun070105/orch-bridge/commit/06a6a20cef1ab5b87df4ccc9956a7e3ffea69ffd))
+* space compact router scores for readability ([8a17953](https://github.com/JongHyun070105/orch-bridge/commit/8a17953ea6d2d5646b9c30ba4d053c8c98bbe7a6))
+
 ## [1.3.0](https://github.com/JongHyun070105/orch-bridge/compare/v1.2.0...v1.3.0) (2026-10-04)
 
 
