@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from orch_kernel import WorktreeOwnershipRegistry
 from provider_health_state import (
     clear_provider as clear_global_provider,
     mark_quota_exhausted as mark_global_quota_exhausted,
@@ -41,6 +42,7 @@ EVENTS_PATH = DELEGATIONS_DIR / "events.jsonl"
 QUOTA_LEDGER_PATH = DELEGATIONS_DIR / "quota-ledger.jsonl"
 GLOBAL_FACT_LEDGER = DELEGATIONS_DIR / "fact-ledger.jsonl"
 PROVIDER_HEALTH_PATH = BASE / "delegations/provider-health.json"
+WORKTREE_OWNERSHIP = WorktreeOwnershipRegistry(PROJECT_BASE / "delegations")
 
 DEFAULT_TIMEOUT = int(os.environ.get("AI_ORCH_DELEGATE_TIMEOUT", "1200"))
 DEDUP_TTL = int(os.environ.get("AI_ORCH_DEDUP_TTL", "1800"))
@@ -57,13 +59,13 @@ TARGETS = {
     },
     "sonnet": {
         "backend": "agy",
-        "model": "claude-sonnet-4-6-thinking",
-        "label": "Claude Sonnet 4.6 Thinking",
+        "model": "claude-sonnet-5-5",
+        "label": "Claude Sonnet 5.5",
     },
     "opus": {
         "backend": "agy",
-        "model": "claude-opus-4-6-thinking",
-        "label": "Claude Opus 4.6 Thinking",
+        "model": "claude-opus-5-5",
+        "label": "Claude Opus 5.5",
     },
     "gemini-low": {
         "backend": "agy",
@@ -1046,7 +1048,7 @@ def _recover_stale_running(
         # Only disposable read-only worktrees are auto-cleaned.
         if str(mode) == "read_only" and worktree is not None:
             try:
-                _remove_worktree(repo, worktree)
+                _safe_remove_worktree(repo, worktree)
             except Exception:
                 pass
 
@@ -1150,7 +1152,7 @@ def _cleanup_stale_worktrees(
 
         if not dry_run:
             _set_tree_read_only(path, False)
-            _remove_worktree(repo, path)
+            _safe_remove_worktree(repo, path)
 
     if not dry_run:
         _run(["git", "worktree", "prune"], cwd=repo, timeout=30)
@@ -1173,7 +1175,36 @@ def _prepare_worktree(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if path.exists():
-        shutil.rmtree(path, ignore_errors=True)
+        raise RuntimeError(
+            f"WORKTREE_PATH_OCCUPIED: refusing to delete unproven existing path: {path}"
+        )
+
+    worktree_id = f"{job_seg}/{worker_seg}"
+
+    def rollback_created(branch: str | None) -> None:
+        # This checkout/branch was created by this call and no worker has been
+        # launched yet, so rollback is mechanically owned and bounded.
+        try:
+            _set_tree_read_only(path, False)
+        except Exception:
+            pass
+        try:
+            _run(
+                ["git", "worktree", "remove", "--force", str(path)],
+                cwd=repo,
+                timeout=60,
+            )
+        except Exception:
+            pass
+        if branch:
+            try:
+                _run(["git", "branch", "-D", branch], cwd=repo, timeout=30)
+            except Exception:
+                pass
+        try:
+            _run(["git", "worktree", "prune"], cwd=repo, timeout=30)
+        except Exception:
+            pass
 
     if mode == "read_only":
         p = _run(
@@ -1184,6 +1215,22 @@ def _prepare_worktree(
         if p.returncode != 0:
             raise RuntimeError(f"read-only worktree add failed: {p.stderr.strip()}")
         _set_tree_read_only(path, True)
+        try:
+            WORKTREE_OWNERSHIP.register({
+                "worktree_id": worktree_id,
+                "owner_job_id": parent_job_id,
+                "owner_agent_id": worker_id,
+                "repo_id": str(_repo_root(repo)),
+                "base_commit": head,
+                "branch": None,
+                "path": str(path),
+                "mode": "read_only",
+                "lifecycle": "LEASE_ACTIVE",
+                "cleanup_state": "ACTIVE",
+            })
+        except Exception:
+            rollback_created(None)
+            raise
         return path, None, True
 
     branch = f"orch/{job_seg}/{worker_seg}"
@@ -1194,17 +1241,120 @@ def _prepare_worktree(
     )
     if p.returncode != 0:
         raise RuntimeError(f"write worktree add failed: {p.stderr.strip()}")
+    try:
+        WORKTREE_OWNERSHIP.register({
+            "worktree_id": worktree_id,
+            "owner_job_id": parent_job_id,
+            "owner_agent_id": worker_id,
+            "repo_id": str(_repo_root(repo)),
+            "base_commit": head,
+            "branch": branch,
+            "path": str(path),
+            "mode": "write",
+            "lifecycle": "LEASE_ACTIVE",
+            "cleanup_state": "PRESERVE_UNTIL_PROVEN",
+        })
+    except Exception:
+        rollback_created(branch)
+        raise
     return path, branch, False
 
+def _worktree_registry_id(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(WORKTREES_DIR.resolve()).as_posix()
+    except Exception:
+        return ""
 
-def _remove_worktree(repo: Path, path: Path) -> None:
-    _set_tree_read_only(path, False)
-    _run(
-        ["git", "worktree", "remove", "--force", str(path)],
-        cwd=repo,
-        timeout=60,
+
+def _safe_remove_worktree(repo: Path, path: Path) -> str:
+    """Delete only a worktree whose ownership and disposable state are proven."""
+    path = path.resolve()
+    worktree_id = _worktree_registry_id(path)
+    record = WORKTREE_OWNERSHIP.get(worktree_id) if worktree_id else None
+    ownership_proven = bool(record)
+
+    if record:
+        try:
+            ownership_proven = ownership_proven and (
+                Path(str(record.get("path") or "")).expanduser().resolve() == path
+            )
+            ownership_proven = ownership_proven and (
+                Path(str(record.get("repo_id") or "")).expanduser().resolve()
+                == _repo_root(repo)
+            )
+            ownership_proven = ownership_proven and (_repo_root(path) == path)
+        except Exception:
+            ownership_proven = False
+
+    dirty = True
+    unique_commits = 1
+    if ownership_proven and record:
+        try:
+            dirty = bool(_git(path, "status", "--porcelain=v1", "--untracked-files=all"))
+            base_commit = str(record.get("base_commit") or "")
+            if base_commit:
+                unique_raw = _git(path, "rev-list", "--count", f"{base_commit}..HEAD")
+                unique_commits = int(unique_raw or "0")
+            else:
+                unique_commits = 1
+        except Exception:
+            ownership_proven = False
+            dirty = True
+            unique_commits = 1
+
+    decision = WORKTREE_OWNERSHIP.cleanup_decision(
+        ownership_proven=ownership_proven,
+        dirty=dirty,
+        unique_commits=unique_commits,
+        remote_confirmed=False,
     )
-    _run(["git", "worktree", "prune"], cwd=repo, timeout=30)
+    if record:
+        try:
+            WORKTREE_OWNERSHIP.mark_cleanup(
+                worktree_id,
+                decision,
+                dirty=dirty,
+                unique_commits=unique_commits,
+                ownership_proven=ownership_proven,
+            )
+        except Exception:
+            pass
+
+    if decision != "DELETE_ELIGIBLE":
+        print(
+            f"[delegate] preserve worktree {path}: cleanup={decision} "
+            f"ownership={ownership_proven} dirty={dirty} unique={unique_commits}",
+            file=sys.stderr,
+        )
+        return decision
+
+    try:
+        _set_tree_read_only(path, False)
+        p = _run(
+            ["git", "worktree", "remove", "--force", str(path)],
+            cwd=repo,
+            timeout=60,
+        )
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr.strip() or "git worktree remove failed")
+        _run(["git", "worktree", "prune"], cwd=repo, timeout=30)
+    except Exception as exc:
+        if record:
+            try:
+                WORKTREE_OWNERSHIP.mark_cleanup(
+                    worktree_id,
+                    "CLEANUP_FAILED",
+                    error=repr(exc),
+                )
+            except Exception:
+                pass
+        raise
+    if record:
+        try:
+            WORKTREE_OWNERSHIP.mark_cleanup(worktree_id, "CLEANED")
+        except Exception:
+            pass
+    return "CLEANED"
 
 
 def _governance_text(repo: Path) -> str:
@@ -1372,18 +1522,19 @@ def _run_agy(
     timeout: int,
     env: dict[str, str],
 ) -> tuple[int, str, str, str]:
-    argv = [
-        "agy",
-        "-p",
-        prompt,
-        "--model",
-        model,
+    argv = ["agy", "-p", prompt, "--model", model]
+    if model.startswith("claude-"):
+        effort = str(env.get("AI_ORCH_AGY_CLAUDE_EFFORT", "medium")).strip().lower()
+        if effort not in {"low", "medium", "high"}:
+            effort = "medium"
+        argv.extend(["--effort", effort])
+    argv.extend([
         "--output-format",
         "stream-json",
         "--dangerously-skip-permissions",
         "--print-timeout",
         f"{max(1, timeout // 60)}m",
-    ]
+    ])
     p = _run(argv, cwd=cwd, timeout=timeout, env=env)
     final = ""
     for line in p.stdout.splitlines():
@@ -2366,7 +2517,7 @@ def delegate(args: argparse.Namespace) -> int:
 
         if worktree is not None and ephemeral:
             try:
-                _remove_worktree(repo, worktree)
+                _safe_remove_worktree(repo, worktree)
             except Exception as e:
                 print(f"[delegate] warning: failed to remove temp worktree: {e}", file=sys.stderr)
 

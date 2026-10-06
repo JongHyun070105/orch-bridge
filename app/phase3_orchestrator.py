@@ -53,8 +53,8 @@ QUOTA_RESERVE = float(os.environ.get("AI_ORCH_DELEGATE_QUOTA_RESERVE", "3"))
 TARGETS: dict[str, dict[str, Any]] = {
     "codex": {"backend": "codex", "model": None, "label": "GPT-6 Luna", "pool": "codex", "cost": 4},
     "cmd": {"backend": "cmd", "model": "xiaomi/mimo-v2.5-pro", "label": "MiMo V2.5 Pro", "pool": "cmd", "cost": 1},
-    "sonnet": {"backend": "agy", "model": "claude-sonnet-4-6-thinking", "label": "Claude Sonnet 4.6 Thinking", "pool": "agy-third", "cost": 3},
-    "opus": {"backend": "agy", "model": "claude-opus-4-6-thinking", "label": "Claude Opus 4.6 Thinking", "pool": "agy-third", "cost": 9},
+    "sonnet": {"backend": "agy", "model": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "pool": "agy-third", "cost": 3},
+    "opus": {"backend": "agy", "model": "claude-opus-5-5", "label": "Claude Opus 5.5", "pool": "agy-third", "cost": 9},
     "gemini-low": {"backend": "agy", "model": "gemini-3.8-flash-low", "label": "Gemini 3.8 Flash low", "pool": "agy-gemini", "cost": 1},
     "gemini-medium": {"backend": "agy", "model": "gemini-3.8-flash-medium", "label": "Gemini 3.8 Flash medium", "pool": "agy-gemini", "cost": 2},
     "gemini-high": {"backend": "agy", "model": "gemini-3.8-flash-high", "label": "Gemini 3.8 Flash high", "pool": "agy-gemini", "cost": 3},
@@ -1055,11 +1055,17 @@ def invoke_target(target: str, cwd: Path, prompt: str, timeout: int, env: dict[s
         return p.returncode, final, p.stdout, p.stderr
 
     if spec["backend"] == "agy":
-        argv = [
-            "agy", "-p", prompt, "--model", str(spec["model"]),
+        model = str(spec["model"])
+        argv = ["agy", "-p", prompt, "--model", model]
+        if model.startswith("claude-"):
+            effort = str(env.get("AI_ORCH_AGY_CLAUDE_EFFORT", "medium")).strip().lower()
+            if effort not in {"low", "medium", "high"}:
+                effort = "medium"
+            argv.extend(["--effort", effort])
+        argv.extend([
             "--output-format", "stream-json", "--dangerously-skip-permissions",
             "--print-timeout", f"{max(1, timeout // 60)}m",
-        ]
+        ])
         p = run_process(argv, cwd=cwd, timeout=timeout, env=env)
         final = ""
         for line in p.stdout.splitlines():

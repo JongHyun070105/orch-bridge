@@ -39,8 +39,8 @@ def test_v13_metadata_and_public_defaults():
     ):
         assert data[key] == 1
     assert data["platforms"] == ["macOS", "Linux"]
-    assert data["components"]["ai_chat_tui"] == "1.3.0"
-    assert data["components"]["ai_orch"] == "1.3.0"
+    assert tuple(int(x) for x in data["components"]["ai_chat_tui"].split(".")) >= (1, 3, 0)
+    assert tuple(int(x) for x in data["components"]["ai_orch"].split(".")) >= (1, 3, 0)
     tui = (APP / "ai_chat_tui.py").read_text()
     assert 'permission_profile", "guarded"' in tui
     assert ".local/share/orchbridge" in tui
@@ -127,10 +127,10 @@ def test_claude_55_adaptive_effort_and_safe_stream_visibility():
 def test_exact_agy_thinking_models_and_proactive_delegate_budget():
     p1 = (APP / "phase1_supervisor.py").read_text()
     p3 = (APP / "phase3_orchestrator.py").read_text()
-    assert '"model": "claude-sonnet-4-6-thinking"' in p1
-    assert '"model": "claude-opus-4-6-thinking"' in p1
-    assert '"model": "claude-sonnet-4-6-thinking"' in p3
-    assert '"model": "claude-opus-4-6-thinking"' in p3
+    assert '"model": "claude-sonnet-5-5"' in p1
+    assert '"model": "claude-opus-5-5"' in p1
+    assert '"model": "claude-sonnet-5-5"' in p3
+    assert '"model": "claude-opus-5-5"' in p3
     assert "status NOT IN ('BLOCKED', 'CANCELLED')" in p1
     assert "status NOT IN ('BLOCKED', 'CANCELLED')" in p3
     assert "[delegate] auto-select role=" in p1

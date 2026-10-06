@@ -19,7 +19,7 @@ from textual.binding import Binding
 from textual.command import CommandPalette
 from textual.containers import VerticalScroll
 from textual.message import Message
-from textual.widgets import Collapsible, Footer, RichLog, Static, TextArea
+from textual.widgets import Collapsible, RichLog, Static, TextArea
 
 from desktop_notify import backend_status as desktop_notify_backend_status, send_notification
 from platform_support import copy_text
@@ -30,6 +30,20 @@ from orch_runtime import (
     load_json as runtime_load_json,
     process_pgid,
     write_main_lease,
+)
+
+from orch_kernel import (
+    EventJournal,
+    GoalStore,
+    MainCheckoutLeaseManager,
+    ObserverEngine,
+    RepoIdentity,
+    WorkflowStore,
+    binding_digest,
+    build_project_binding,
+    find_live_prompt_collision,
+    validate_project_binding,
+    verify_completion,
 )
 
 HOME = Path.home()
@@ -108,6 +122,7 @@ DELEGATION_EVENTS_FILE = PROJECT_BASE / "delegations/events.jsonl"
 DELEGATION_REGISTRY_DB = PROJECT_BASE / "delegations/registry.sqlite3"
 WORKER = APP_DIR / "ai_job_worker.py"
 UPDATE_MANAGER = APP_DIR / "ai_update_manager.py"
+CHECKOUT_LEASE_MANAGER = MainCheckoutLeaseManager(BASE / "global/main-checkout-leases")
 VERSION_FILE = BASE / "VERSION.json"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 (PROJECT_BASE / "delegations").mkdir(parents=True, exist_ok=True)
@@ -272,8 +287,8 @@ SLASH_COMMANDS = [
     ("/model auto", "작업에 맞게 모델 자동 선택"),
     ("/model cmd", "MiMo V2.5 Pro로 모델 고정"),
     ("/model codex", "GPT-6 Luna로 모델 고정"),
-    ("/model sonnet", "AGY Claude Sonnet 4.6 Thinking으로 모델 고정"),
-    ("/model opus", "AGY Claude Opus 4.6 Thinking으로 모델 고정"),
+    ("/model sonnet", "AGY Claude Sonnet 5.5으로 모델 고정"),
+    ("/model opus", "AGY Claude Opus 5.5으로 모델 고정"),
     ("/model claude", "Claude.ai 구독 Claude Code Sonnet 5.5로 모델 고정"),
     ("/model claude-opus", "Claude.ai 구독 Claude Code Opus 5.5로 모델 고정"),
     ("/model gemini-low", "Gemini 3.8 Flash low로 모델 고정"),
@@ -303,10 +318,17 @@ SLASH_COMMANDS = [
     ("/copy all", "User / Assistant 대화 내용만 복사"),
     ("/copy worked", "마지막 답변 + WORKED 요약 복사"),
     ("/copy prompt", "현재 작업의 정확한 프롬프트 복사"),
+    ("/ui compact|verbose", "기본 TUI 정보 밀도 설정"),
     ("/compact", "재개용 압축 체크포인트 작성"),
 
     ("/jobs", "영구 작업 목록 보기"),
     ("/job", "현재 작업 메타데이터 보기"),
+    ("/goal", "현재 durable goal / completion audit 보기"),
+    ("/todo", "현재 durable todo 보기"),
+    ("/todo add <text>", "현재 작업 durable todo 추가"),
+    ("/journal", "현재 작업 event journal 상태 보기"),
+    ("/runtime", "binding / journal / workflow runtime 상태 보기"),
+    ("/reconcile <intent-id> <success|not-run|failed>", "미확정 side effect를 사용자 확인으로 종결"),
     ("/pause", "현재 작업 일시정지"),
     ("/resume", "일시정지된 작업 재개"),
     ("/retry", "현재 일시정지 작업 재시도 / 재개"),
@@ -517,8 +539,8 @@ def pretty_route(route: str) -> str:
         "codex": _codex_display_name(),
         "claude-sonnet": "Claude Code Sonnet 5.5",
         "claude-opus": "Claude Code Opus 5.5",
-        "sonnet": "AGY Claude Sonnet 4.6 Thinking",
-        "opus": "AGY Claude Opus 4.6 Thinking",
+        "sonnet": "AGY Claude Sonnet 5.5",
+        "opus": "AGY Claude Opus 5.5",
         "gemini-high": "Gemini 3.8 Flash · high",
         "gemini-medium": "Gemini 3.8 Flash · medium",
         "gemini-low": "Gemini 3.8 Flash · low",
@@ -526,13 +548,59 @@ def pretty_route(route: str) -> str:
     }
     out = route
     for key, label in mapping.items():
-        out = re.sub(rf"\b{re.escape(key)}(?=\()", label + " ", out)
+        out = re.sub(rf"\b{re.escape(key)}(?=\(|$)", label + " ", out)
     return out
 
 
-def pretty_router_panel(route: str) -> str:
+def _route_score(part: str) -> str | None:
+    raw = str(part or "")
+    legacy = re.search(r"(?:^|[,(\s])u=([-+]?\d+(?:\.\d+)?)", raw)
+    if legacy:
+        return legacy.group(1)
+    trailing = re.search(r"\(([-+]?\d+(?:\.\d+)?)\)\s*$", raw)
+    return trailing.group(1) if trailing else None
+
+
+def _compact_route_part(part: str) -> str:
+    raw = str(part or "").strip()
+    score = _route_score(raw)
+    raw = re.sub(r"\s*·?\s*subscription\s*\([^)]*\)", "", raw, flags=re.I)
+    raw = re.sub(r"\s*·?\s*subscription\b", "", raw, flags=re.I)
+    raw = re.sub(r"\([^)]*\bu=[^)]*\)", "", raw)
+    if score:
+        raw = re.sub(r"\s*\([-+]?\d+(?:\.\d+)?\)\s*$", "", raw)
+    label = pretty_route(raw).strip(" ·")
+    label = re.sub(r"\s{2,}", " ", label)
+    return f"{label} ({score})" if score else label
+
+
+def compact_route(route: str) -> str:
     parts = [x.strip() for x in str(route or "").split(" > ") if x.strip()]
-    return "\n".join(f"{i}. {pretty_route(part)}" for i, part in enumerate(parts, 1)) or "no viable candidates reported"
+    return " > ".join(_compact_route_part(part) for part in parts)
+
+
+def compact_model_status(model: str) -> str:
+    text = re.sub(r"\s*·\s*subscription\b", "", str(model or ""), flags=re.I)
+    return re.sub(r"\s{2,}", " ", text).strip(" ·")
+
+
+def compact_quota_summary(summary: str) -> str:
+    text = str(summary or "")
+    hits = re.findall(
+        r"(?i)\b(5h|7d|wk|week|month(?:ly)?)\s*[:=]?\s*(\d{1,3}(?:\.\d+)?)%",
+        text,
+    )
+    if hits:
+        return " · ".join(f"{name} {pct}%" for name, pct in hits)
+    text = re.sub(r"(?i)\s*·?\s*reset\s+[^·]+", "", text)
+    text = re.sub(r"(?i)\s*·?\s*cached\b.*$", "", text)
+    return re.sub(r"\s{2,}", " ", text).strip(" ·")
+
+
+def pretty_router_panel(route: str, *, compact: bool = True) -> str:
+    parts = [x.strip() for x in str(route or "").split(" > ") if x.strip()]
+    formatter = _compact_route_part if compact else pretty_route
+    return "\n".join(f"{i}. {formatter(part)}" for i, part in enumerate(parts, 1)) or "no viable candidates reported"
 
 
 def router_decision_source(decision: str) -> str:
@@ -875,13 +943,6 @@ class OrchBridgeApp(App):
         border-top: solid #202832;
     }
 
-    #composer-label {
-        height: 1;
-        padding: 0 2;
-        background: #0b0d10;
-        color: #6f7f90;
-    }
-
     #prompt {
         height: 6;
         padding: 0 1;
@@ -894,10 +955,6 @@ class OrchBridgeApp(App):
         border: round #7aa2f7;
     }
 
-    Footer {
-        background: #11151b;
-        color: #8f9aaa;
-    }
     """
 
     BINDINGS = [
@@ -925,6 +982,7 @@ class OrchBridgeApp(App):
         self.attempts: list[Attempt] = []
         self.current: Attempt | None = None
         self.verbosity = "normal"
+        self.ui_density = "compact"
         self.route = ""
         self.router_decision = ""
         self.route_excluded = ""
@@ -1140,6 +1198,8 @@ class OrchBridgeApp(App):
         self.permission_profile = perm if perm in {"trusted", "guarded"} else "guarded"
         notify = str(data.get("notify_mode", "smart")).lower()
         self.notify_mode = notify if notify in {"smart", "all", "important", "off"} else "smart"
+        density = str(data.get("ui_density", "compact")).lower()
+        self.ui_density = density if density in {"compact", "verbose"} else "compact"
         plan = data.get("pending_branch_plan")
         self.pending_branch_plan = plan if isinstance(plan, dict) else None
 
@@ -1152,6 +1212,7 @@ class OrchBridgeApp(App):
                 "scope_mode": self.scope_mode,
                 "permission_profile": self.permission_profile,
                 "notify_mode": self.notify_mode,
+                "ui_density": self.ui_density,
                 "pending_branch_plan": self.pending_branch_plan,
                 "updated_at": iso(),
             },
@@ -1163,6 +1224,7 @@ class OrchBridgeApp(App):
             "router_enabled": self.router_enabled,
             "scope_mode": self.scope_mode,
             "permission_profile": self.permission_profile,
+            "ui_density": self.ui_density,
         }
 
 
@@ -1198,7 +1260,7 @@ class OrchBridgeApp(App):
         self.update_commandbar()
         after = self._current_runtime_state()
         changed = [
-            key for key in ("model_override", "router_enabled", "scope_mode", "permission_profile", "notify_mode")
+            key for key in ("model_override", "router_enabled", "scope_mode", "permission_profile", "notify_mode", "ui_density")
             if before.get(key) != after.get(key)
         ]
         changed_text = ", ".join(changed) if changed else "none"
@@ -1869,6 +1931,149 @@ class OrchBridgeApp(App):
                 return i
         return None
 
+    def _current_project_binding(self, prompt_sha: str) -> dict[str, Any]:
+        return build_project_binding(
+            repo=getattr(self, "repo", REPO_DEFAULT),
+            workspace_id=WORKSPACE_ID or os.getenv("AI_ORCH_WORKSPACE_ID"),
+            project_base=PROJECT_BASE,
+            project_name=PROJECT_NAME or os.getenv("AI_ORCH_PROJECT_NAME") or getattr(self, "repo", REPO_DEFAULT).name,
+            prompt_sha256=prompt_sha,
+        )
+
+    def _validate_binding(
+        self,
+        binding: dict[str, Any],
+        digest: str | None,
+        prompt_sha: str,
+    ) -> tuple[bool, str]:
+        return validate_project_binding(
+            binding=binding,
+            digest=digest,
+            repo=self.repo,
+            workspace_id=WORKSPACE_ID or os.getenv("AI_ORCH_WORKSPACE_ID"),
+            project_base=PROJECT_BASE,
+            prompt_sha256=prompt_sha,
+        )
+
+    def _queue_entry_binding_ok(self, entry: dict[str, Any]) -> tuple[bool, str]:
+        prompt = str(entry.get("prompt") or "")
+        prompt_sha = self._prompt_sha(prompt)
+        if str(entry.get("prompt_sha256") or "") != prompt_sha:
+            return False, "PROJECT_BINDING_MISMATCH: queue prompt hash changed"
+        binding = entry.get("project_binding")
+        if not isinstance(binding, dict):
+            # v1.3 project-local queues predate immutable bindings. Migrate only
+            # when the queue is already scoped by a registered workspace; never
+            # guess the owner of legacy global queue state.
+            if not WORKSPACE_ID or PROJECT_BASE.resolve() == BASE.resolve():
+                return False, "PROJECT_BINDING_MISMATCH: legacy global queue has no provable project binding"
+            binding = self._current_project_binding(prompt_sha)
+            entry["project_binding"] = binding
+            entry["binding_sha256"] = binding_digest(binding)
+            entry["binding_migrated_from"] = "v1.3-project-local"
+            self._save_queue_state()
+        return self._validate_binding(
+            binding,
+            str(entry.get("binding_sha256") or "") or None,
+            prompt_sha,
+        )
+
+    def _job_binding_ok(self) -> tuple[bool, str]:
+        if not self.job or not self.job_dir:
+            return False, "PROJECT_BINDING_MISMATCH: no active job"
+        try:
+            prompt = (self.job_dir / "original-prompt.md").read_text()
+        except Exception as exc:
+            return False, f"PROJECT_BINDING_MISMATCH: original prompt unavailable: {exc}"
+        prompt_sha = self._prompt_sha(prompt)
+        if str(self.job.get("prompt_sha256") or "") != prompt_sha:
+            return False, "PROJECT_BINDING_MISMATCH: persisted prompt hash differs"
+        binding = self.job.get("project_binding")
+        if not isinstance(binding, dict):
+            return False, "PROJECT_BINDING_MISMATCH: job has no immutable binding"
+        return self._validate_binding(
+            binding,
+            str(self.job.get("binding_sha256") or "") or None,
+            prompt_sha,
+        )
+
+    def _journal(self) -> EventJournal | None:
+        return EventJournal(self.job_dir / "journal-v14.jsonl") if self.job_dir else None
+
+    def _goal_store(self) -> GoalStore | None:
+        return GoalStore(self.job_dir) if self.job_dir else None
+
+    def _workflow_store(self) -> WorkflowStore | None:
+        return WorkflowStore(self.job_dir) if self.job_dir else None
+
+    def _initialize_durable_runtime(self, prompt: str) -> None:
+        if not self.job or not self.job_dir:
+            return
+        journal = self._journal()
+        assert journal is not None
+        if not journal.path.exists() or not journal.read():
+            journal.append(
+                "job.created",
+                job_id=str(self.job.get("id") or self.job_dir.name),
+                repo=str(self.repo),
+                project_binding=self.job.get("project_binding") or {},
+                binding_sha256=self.job.get("binding_sha256"),
+                prompt_sha256=self.job.get("prompt_sha256"),
+            )
+        goal = GoalStore(self.job_dir)
+        goal.initialize(prompt.strip())
+        workflow = WorkflowStore(self.job_dir)
+        workflow.initialize(capacity=max(1, int(self.job.get("max_delegates") or 3) + 1))
+        workflow.set_owner(str(self.job.get("id") or self.job_dir.name))
+        workflow.transition("main", "QUEUED")
+        workflow.transition("verify", "WAITING")
+        self.job["runtime_v14"] = {
+            "journal": "journal-v14.jsonl",
+            "goal": "goal.json",
+            "todo": "todo.json",
+            "workflow": "workflow.json",
+            "schema": 1,
+        }
+
+    def _release_checkout_lease(self) -> bool:
+        if not self.job:
+            return True
+        token = str(self.job.get("checkout_lease_token") or "") or None
+        released = CHECKOUT_LEASE_MANAGER.release(repo=self.repo, token=token)
+        if released:
+            self.job["checkout_lease_token"] = None
+        return released
+
+    def _quarantine_checkout(self, reason: str) -> bool:
+        if not self.job or not self.job_dir:
+            return False
+        token = str(self.job.get("checkout_lease_token") or "") or None
+        try:
+            if not token or not CHECKOUT_LEASE_MANAGER.owns(repo=self.repo, token=token):
+                token = CHECKOUT_LEASE_MANAGER.acquire(
+                    repo=self.repo,
+                    job_id=str(self.job.get("id") or self.job_dir.name),
+                    job_dir=self.job_dir,
+                )
+                self.job["checkout_lease_token"] = token
+            CHECKOUT_LEASE_MANAGER.quarantine(
+                repo=self.repo,
+                token=token,
+                reason=reason,
+            )
+            self.job["checkout_quarantine"] = {
+                "reason": reason,
+                "since": iso(),
+            }
+            return True
+        except Exception as exc:
+            self.job["checkout_quarantine"] = {
+                "reason": reason,
+                "error": repr(exc),
+                "since": iso(),
+            }
+            return False
+
     def _queue_enqueue(
         self,
         prompt: str,
@@ -1897,6 +2102,8 @@ class OrchBridgeApp(App):
             result = dict(duplicate)
             result["_duplicate_suppressed"] = True
             return result
+
+        binding = self._current_project_binding(prompt_sha)
         entry_id = (
             "queue-" + datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-")
             + hashlib.sha256((prompt + str(now())).encode("utf-8")).hexdigest()[:8]
@@ -1909,6 +2116,8 @@ class OrchBridgeApp(App):
             "attachments": list(dict.fromkeys(str(x) for x in attachments if str(x))),
             "runtime": self._current_runtime_state(),
             "branch_plan": self._branch_next_plan(),
+            "project_binding": binding,
+            "binding_sha256": binding_digest(binding),
         }
         self.queue_state.setdefault("items", []).append(entry)
         if gate and not self.queue_state.get("gate") and not self.queue_state.get("active_entry_id"):
@@ -1982,18 +2191,25 @@ class OrchBridgeApp(App):
             self._queue_halt("QUEUE_ENTRY_INVALID: id가 없는 대기 작업을 발견했습니다.")
             return
 
-        # Persist the claim before creating the job. A restart can repair this
-        # claim from job.queue_entry_id, or release it if no job was created.
+        binding_ok, binding_reason = self._queue_entry_binding_ok(entry)
+        if not binding_ok:
+            self._queue_halt(binding_reason)
+            return
+
+        # Persist the claim before creating the job. The queue item remains durable
+        # if launch fails, but project binding is revalidated before any mutation.
         self.queue_state["active_entry_id"] = entry_id
         self._save_queue_state()
         try:
-            self._branch_apply_plan(entry.get("branch_plan") if isinstance(entry.get("branch_plan"), dict) else None)
             self._queue_apply_runtime(entry)
             attachments = [str(x) for x in entry.get("attachments", []) if str(x)]
             self.new_job(
                 str(entry.get("prompt") or ""),
                 attachments=attachments,
                 queue_entry_id=entry_id,
+                expected_binding=entry.get("project_binding"),
+                expected_binding_sha=str(entry.get("binding_sha256") or "") or None,
+                branch_plan=entry.get("branch_plan") if isinstance(entry.get("branch_plan"), dict) else None,
             )
             self.queue_state["gate"] = self._queue_gate_for_current_job()
             self.queue_state["halted_reason"] = None
@@ -2004,8 +2220,6 @@ class OrchBridgeApp(App):
                 collapsed=False,
             )
         except Exception as e:
-            # Keep the queue item. If a job was created, recovery will repair
-            # the active claim; otherwise release it for an explicit retry.
             if not (self.job and str(self.job.get("queue_entry_id") or "") == entry_id):
                 self.queue_state["active_entry_id"] = None
             self.queue_state["halted_reason"] = (
@@ -2353,8 +2567,8 @@ class OrchBridgeApp(App):
             "cmd": "MiMo V2.5 Pro",
             "claude-sonnet": "Claude Code Sonnet 5.5 · subscription",
             "claude-opus": "Claude Code Opus 5.5 · subscription",
-            "sonnet": "AGY Claude Sonnet 4.6 Thinking",
-            "opus": "AGY Claude Opus 4.6 Thinking",
+            "sonnet": "AGY Claude Sonnet 5.5",
+            "opus": "AGY Claude Opus 5.5",
             "gemini-low": "Gemini 3.8 Flash · low",
             "gemini-medium": "Gemini 3.8 Flash · medium",
             "gemini-high": "Gemini 3.8 Flash · high",
@@ -2716,9 +2930,7 @@ class OrchBridgeApp(App):
         yield VerticalScroll(id="feed")
         yield Static("No active agents", id="agentdock")
         yield Static("", id="commandbar")
-        yield Static("MESSAGE  ·  Enter send/queue  ·  Shift+Enter newline  ·  Ctrl+U clear  ·  Ctrl+Y copy  ·  / commands", id="composer-label")
         yield TextArea("", id="prompt", soft_wrap=True, show_line_numbers=False)
-        yield Footer()
 
     def on_mount(self) -> None:
         self.set_interval(1.0, self.tick)
@@ -2729,9 +2941,18 @@ class OrchBridgeApp(App):
     def update_banner(self) -> None:
         branch = git_branch(self.repo)
         job_state = self.job.get("status", "READY") if self.job else "READY"
+        project_label = self.repo.name
+        binding = (self.job or {}).get("project_binding")
+        if isinstance(binding, dict) and binding.get("project_name"):
+            project_label = str(binding.get("project_name"))
         self.query_one("#brand", Static).update(
-            f"  ORCHBRIDGE v{orchestrator_version()}   {job_state}   ·   {self.repo.name}   ·   {branch}"
+            f"  ORCHBRIDGE v{orchestrator_version()}   {job_state}   ·   {project_label}   ·   {branch}"
         )
+
+        if self.ui_density == "compact":
+            route = compact_route(self.route) if self.route else "AUTO"
+            self.query_one("#runtime", Static).update(f"  {route}")
+            return
 
         route = pretty_route(self.route) if self.route else "AUTO"
         active_scope = (
@@ -2739,11 +2960,7 @@ class OrchBridgeApp(App):
             if self.job and self.job.get("scope_mode")
             else self.scope_mode
         )
-        prompt_sha = (
-            str(self.job.get("prompt_sha256", ""))[:8]
-            if self.job
-            else "-"
-        )
+        prompt_sha = str(self.job.get("prompt_sha256", ""))[:8] if self.job else "-"
         mode = (
             f"router {'on' if self.router_enabled else 'off'}"
             f" · model {self.model_override}"
@@ -2977,6 +3194,8 @@ class OrchBridgeApp(App):
                 continue
 
             if j.get("status") not in {
+                "PREPARING",
+                "READY",
                 "RUNNING",
                 "PAUSED_QUOTA",
                 "PAUSED_RETRY",
@@ -2993,8 +3212,184 @@ class OrchBridgeApp(App):
 
             self.job_dir, self.job = d, j
             self._recovered_main_result_posted = False
+
+            try:
+                recovered_prompt = (d / "original-prompt.md").read_text()
+            except Exception:
+                recovered_prompt = ""
+            prompt_sha = self._prompt_sha(recovered_prompt) if recovered_prompt else ""
+
+            # Safe one-time migration for public v1.3 jobs: context equality was
+            # already proven above, and the original prompt hash must still agree.
+            if not isinstance(j.get("project_binding"), dict):
+                if not recovered_prompt or str(j.get("prompt_sha256") or "") != prompt_sha:
+                    j["status"] = "BLOCKED"
+                    j["task_status"] = "BLOCKED"
+                    j["binding_error"] = "PROJECT_BINDING_MISMATCH: legacy prompt cannot be proven"
+                    self.save()
+                    self.note(j["binding_error"], title="PROJECT BINDING GUARD", collapsed=False)
+                    break
+                old_schema = int(j.get("schema_version") or 0)
+                binding = self._current_project_binding(prompt_sha)
+                j["project_binding"] = binding
+                j["binding_sha256"] = binding_digest(binding)
+                j["schema_version"] = max(3, old_schema)
+                self._initialize_durable_runtime(recovered_prompt)
+                journal = self._journal()
+                if journal:
+                    journal.append(
+                        "runtime.legacy_binding_migrated",
+                        job_id=str(j.get("id") or d.name),
+                        from_schema=old_schema,
+                    )
+                self.save()
+
+            binding_ok, binding_reason = self._job_binding_ok()
+            if not binding_ok:
+                j["status"] = "BLOCKED"
+                j["task_status"] = "BLOCKED"
+                j["binding_error"] = binding_reason
+                self._release_checkout_lease()
+                self.save()
+                self.note(binding_reason, title="PROJECT BINDING GUARD", collapsed=False)
+                break
+
+            proposal = ObserverEngine.repo_identity_proposal(
+                repo=self.repo,
+                binding=j.get("project_binding") or {},
+            )
+            if proposal.get("action") != "ALLOW":
+                j["status"] = "BLOCKED"
+                j["task_status"] = "BLOCKED"
+                j["binding_error"] = str(proposal.get("reason") or "REPO_IDENTITY_MISMATCH")
+                self._release_checkout_lease()
+                self.save()
+                self.note(j["binding_error"], title="REPO OBSERVER", collapsed=False)
+                break
+
+            journal = self._journal()
+            assert journal is not None
+
+            # A crash can happen after PREPARING is durable but before the first
+            # journal record. That specific window is safe to reconstruct only if
+            # Git state is still exactly the recorded start state.
+            if not journal.path.exists() or not journal.anchor_path.exists():
+                safe_preparing_bootstrap = (
+                    str(j.get("status") or "") == "PREPARING"
+                    and git_branch(self.repo) == str(j.get("branch_at_start") or "")
+                    and git_head(self.repo) == str(j.get("head_at_start") or "")
+                    and not journal.path.exists()
+                    and not journal.anchor_path.exists()
+                )
+                if safe_preparing_bootstrap:
+                    self._initialize_durable_runtime(recovered_prompt)
+                    journal = self._journal()
+                    assert journal is not None
+                    journal.append(
+                        "runtime.preparing_bootstrap_recovered",
+                        job_id=str(j.get("id") or d.name),
+                    )
+                else:
+                    reason = "V14_JOURNAL_INTEGRITY_FAILURE: durable journal or tail anchor missing"
+                    j["status"] = "NEEDS_USER"
+                    j["task_status"] = "NEEDS_USER"
+                    j["runtime_error"] = reason
+                    self._quarantine_checkout(reason)
+                    self.save()
+                    self.note(reason, title="RUNTIME INTEGRITY", collapsed=False)
+                    break
+
+            ok, reason = journal.verify()
+            if not ok:
+                runtime_error = "V14_JOURNAL_INTEGRITY_FAILURE: " + reason
+                j["status"] = "NEEDS_USER"
+                j["task_status"] = "NEEDS_USER"
+                j["runtime_error"] = runtime_error
+                self._quarantine_checkout(runtime_error)
+                self.save()
+                self.note(runtime_error, title="RUNTIME INTEGRITY", collapsed=False)
+                break
+
+            unresolved = journal.unresolved_intents()
+            if unresolved:
+                runtime_error = (
+                    f"V14_UNRESOLVED_SIDE_EFFECT: {len(unresolved)} intent(s) require reconciliation"
+                )
+                j["status"] = "NEEDS_USER"
+                j["task_status"] = "NEEDS_USER"
+                j["runtime_error"] = runtime_error
+                self._quarantine_checkout(runtime_error)
+                self.save()
+                intents = "\n".join(
+                    f"- {row.get('intent_id')} · {row.get('operation')}"
+                    for row in unresolved[:12]
+                )
+                self.note(
+                    runtime_error
+                    + "\nCheckout remains quarantined. Confirm actual external state, then use:\n"
+                    + "/reconcile <intent-id> success|not-run|failed\n"
+                    + intents,
+                    title="RUNTIME RECOVERY",
+                    collapsed=False,
+                )
+                break
+
+            token = str(j.get("checkout_lease_token") or "") or None
+            if token and CHECKOUT_LEASE_MANAGER.owns(repo=self.repo, token=token):
+                try:
+                    CHECKOUT_LEASE_MANAGER.adopt(repo=self.repo, token=token)
+                except Exception:
+                    pass
+
             changed = False
             recovery_detail = ""
+
+            if j["status"] == "PREPARING":
+                # No unresolved intent means branch mutation either never started
+                # or reached a terminal record. If it never started, replay it now
+                # under the same checkout ownership.
+                rows = journal.read()
+                branch_intents = [
+                    row for row in rows
+                    if row.get("event") == "side_effect.intent"
+                    and row.get("operation") == "git.branch_plan"
+                ]
+                if not branch_intents:
+                    plan = j.get("branch_plan") if isinstance(j.get("branch_plan"), dict) else None
+                    branch_intent = journal.intent(
+                        "git.branch_plan",
+                        idempotency_key=f"{j.get('id')}:branch-plan-recovery",
+                        plan=plan,
+                    )
+                    try:
+                        self._branch_apply_plan(plan)
+                    except Exception as exc:
+                        journal.terminal(str(branch_intent["intent_id"]), "failed", error=repr(exc))
+                        j["status"] = "BLOCKED"
+                        j["task_status"] = "BLOCKED"
+                        j["runtime_error"] = f"branch recovery failed: {exc}"
+                        self._release_checkout_lease()
+                        self.save()
+                        self.note(j["runtime_error"], title="BRANCH ERROR", collapsed=False)
+                        break
+                    else:
+                        journal.terminal(
+                            str(branch_intent["intent_id"]),
+                            "success",
+                            branch=git_branch(self.repo),
+                            head=git_head(self.repo),
+                        )
+                j["branch_at_start"] = git_branch(self.repo)
+                j["head_at_start"] = git_head(self.repo)
+                j["status"] = "READY"
+                changed = True
+
+            if j["status"] == "READY":
+                j["status"] = "PAUSED_RETRY"
+                j["resume_at"] = now() + 15
+                self._recovery_grace_until = float(j["resume_at"])
+                recovery_detail = "\nRecovered pre-launch READY state; retry grace 15s."
+                changed = True
 
             if j["status"] == "RUNNING":
                 runtime = self._runtime_for_job(j, d, adopt_legacy=True)
@@ -3022,12 +3417,17 @@ class OrchBridgeApp(App):
             if changed:
                 self.save()
 
-            try:
-                recovered_prompt = (d / "original-prompt.md").read_text()
-            except Exception:
-                recovered_prompt = ""
             if recovered_prompt:
                 self._mount_user_message(recovered_prompt)
+
+            try:
+                journal.append(
+                    "runtime.recovered",
+                    job_id=str(j.get("id") or d.name),
+                    status=str(j.get("status") or ""),
+                )
+            except Exception:
+                pass
 
             msg = f"Recovered {j['id']} · {j['status']} · {j.get('title','task')}" + recovery_detail
             if self._recovery_grace_until and j["status"] != "RUNNING":
@@ -3035,9 +3435,9 @@ class OrchBridgeApp(App):
                     "\nStartup recovery grace: 15s. "
                     "A new prompt will not be allowed while a verified old MAIN worker is alive."
                 )
-
             self.note(msg, title="SESSION", collapsed=False)
             break
+
 
     def save(self) -> None:
         if self.job_dir and self.job:
@@ -3195,59 +3595,146 @@ RESUME RULES:
         *,
         attachments: list[str] | None = None,
         queue_entry_id: str | None = None,
+        expected_binding: dict[str, Any] | None = None,
+        expected_binding_sha: str | None = None,
+        branch_plan: dict[str, Any] | None = None,
     ) -> None:
         stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
         d = JOBS_DIR / f"job-{stamp}"
-        d.mkdir(parents=True)
-        (d / "original-prompt.md").write_text(prompt)
-        (d / "checkpoint.md").write_text("")
+        if d.exists():
+            suffix = hashlib.sha256(f"{time.time_ns()}:{os.getpid()}".encode()).hexdigest()[:6]
+            d = JOBS_DIR / f"job-{stamp}-{suffix}"
 
         scope_mode, max_delegates = self._parse_job_directives(prompt)
         prompt_sha = self._prompt_sha(prompt)
-        attachments = list(self.pending_attachments) if attachments is None else list(attachments)
-        try:
-            pskill = subprocess.run(
-                [str(HOME / ".local/bin/orch-skills"), "select", "--text", prompt, "--limit", "2", "--json"],
-                capture_output=True, text=True, timeout=10,
-                env={**os.environ.copy(), "AI_ORCH_PROJECT_BASE": str(PROJECT_BASE), "AI_ORCH_REPO": str(self.repo)},
-            )
-            skills = json.loads(pskill.stdout) if pskill.returncode == 0 else []
-        except Exception:
-            skills = []
+        binding = self._current_project_binding(prompt_sha)
+        binding_sha = binding_digest(binding)
 
-        self.job_dir = d
-        self.job = {
-            "schema_version": 2,
-            "id": d.name,
-            "title": (prompt.splitlines()[0] if prompt else "task")[:100],
-            "repo": str(self.repo),
-            "workspace_id": os.getenv("AI_ORCH_WORKSPACE_ID"),
-            "project_base": str(PROJECT_BASE),
-            "branch_at_start": git_branch(self.repo),
-            "head_at_start": git_head(self.repo),
-            "created_at": iso(),
-            "updated_at": iso(),
-            "status": "READY",
-            "resume_at": None,
-            "attempt": 0,
-            "task_status": None,
-            "scope_mode": scope_mode,
-            "permission_profile": self.permission_profile,
-            "max_delegates": max_delegates,
-            "prompt_sha256": prompt_sha,
-            "prompt_preview": prompt[:240],
-            "attachments": attachments,
-            "skills": skills,
-            "queue_entry_id": queue_entry_id,
-        }
-        self.save()
-        self.raw.clear()
-        self.attempts.clear()
-        self.current = None
-        self.delegate_states.clear()
-        self._mount_user_message(prompt)
-        self.start(False)
-        self.pending_attachments.clear()
+        if expected_binding is not None:
+            ok, reason = self._validate_binding(
+                expected_binding,
+                expected_binding_sha,
+                prompt_sha,
+            )
+            if not ok or binding_digest(expected_binding) != binding_sha:
+                raise RuntimeError(reason or "PROJECT_BINDING_MISMATCH: queued binding differs from current project")
+
+        collision = find_live_prompt_collision(JOBS_DIR, prompt_sha, repo=self.repo)
+        if collision:
+            raise RuntimeError(
+                "DUPLICATE_MAIN_PROMPT: identical prompt is already running "
+                f"as {collision.get('job_id')} in repo {collision.get('repo')}"
+            )
+
+        lease_token = CHECKOUT_LEASE_MANAGER.acquire(
+            repo=self.repo,
+            job_id=d.name,
+            job_dir=d,
+        )
+        previous_job, previous_job_dir = self.job, self.job_dir
+        try:
+            d.mkdir(parents=True)
+            (d / "original-prompt.md").write_text(prompt)
+            (d / "checkpoint.md").write_text("")
+
+            attachments = list(self.pending_attachments) if attachments is None else list(attachments)
+            try:
+                pskill = subprocess.run(
+                    [str(HOME / ".local/bin/orch-skills"), "select", "--text", prompt, "--limit", "2", "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env={
+                        **os.environ.copy(),
+                        "AI_ORCH_PROJECT_BASE": str(PROJECT_BASE),
+                        "AI_ORCH_REPO": str(self.repo),
+                    },
+                )
+                skills = json.loads(pskill.stdout) if pskill.returncode == 0 else []
+            except Exception:
+                skills = []
+
+            self.job_dir = d
+            self.job = {
+                "schema_version": 3,
+                "id": d.name,
+                "title": (prompt.splitlines()[0] if prompt else "task")[:100],
+                "repo": str(_canonical_repo(self.repo)),
+                "workspace_id": WORKSPACE_ID or os.getenv("AI_ORCH_WORKSPACE_ID"),
+                "project_base": str(PROJECT_BASE),
+                "branch_at_start": git_branch(self.repo),
+                "head_at_start": git_head(self.repo),
+                "created_at": iso(),
+                "updated_at": iso(),
+                "status": "PREPARING",
+                "resume_at": None,
+                "attempt": 0,
+                "task_status": None,
+                "scope_mode": scope_mode,
+                "permission_profile": self.permission_profile,
+                "max_delegates": max_delegates,
+                "prompt_sha256": prompt_sha,
+                "prompt_preview": prompt[:240],
+                "attachments": attachments,
+                "skills": skills,
+                "queue_entry_id": queue_entry_id,
+                "branch_plan": branch_plan,
+                "project_binding": binding,
+                "binding_sha256": binding_sha,
+                "checkout_lease_token": lease_token,
+            }
+            self.save()
+            self._initialize_durable_runtime(prompt)
+
+            journal = self._journal()
+            branch_intent = None
+            if journal and branch_plan:
+                branch_intent = journal.intent(
+                    "git.branch_plan",
+                    idempotency_key=f"{d.name}:branch-plan",
+                    plan=branch_plan,
+                )
+            try:
+                self._branch_apply_plan(branch_plan)
+            except Exception as exc:
+                if journal and branch_intent:
+                    journal.terminal(
+                        str(branch_intent["intent_id"]),
+                        "failed",
+                        error=repr(exc),
+                    )
+                raise
+            else:
+                if journal and branch_intent:
+                    journal.terminal(
+                        str(branch_intent["intent_id"]),
+                        "success",
+                        branch=git_branch(self.repo),
+                        head=git_head(self.repo),
+                    )
+
+            self.job["branch_at_start"] = git_branch(self.repo)
+            self.job["head_at_start"] = git_head(self.repo)
+            self.job["status"] = "READY"
+            self.save()
+
+            self.raw.clear()
+            self.attempts.clear()
+            self.current = None
+            self.delegate_states.clear()
+            self._mount_user_message(prompt)
+            self.start(False)
+            self.pending_attachments.clear()
+        except Exception:
+            CHECKOUT_LEASE_MANAGER.release(repo=self.repo, token=lease_token)
+            if self.job is not None and self.job_dir == d:
+                self.job["status"] = "BLOCKED"
+                self.job["task_status"] = "BLOCKED"
+                self.job["checkout_lease_token"] = None
+                self.save()
+            else:
+                self.job, self.job_dir = previous_job, previous_job_dir
+            raise
 
     def start(self, resume: bool) -> None:
         if not self.job or not self.job_dir:
@@ -3266,6 +3753,19 @@ RESUME RULES:
             )
             return
 
+        binding_ok, binding_reason = self._job_binding_ok()
+        if not binding_ok:
+            self.job.update({
+                "status": "BLOCKED",
+                "task_status": "BLOCKED",
+                "binding_error": binding_reason,
+            })
+            self._release_checkout_lease()
+            self.save()
+            self.note(binding_reason, title="PROJECT BINDING GUARD", collapsed=False)
+            self.update_banner()
+            return
+
         foreign_same_repo = self._foreign_live_same_repo_worker()
         if foreign_same_repo:
             self.note(
@@ -3276,6 +3776,24 @@ RESUME RULES:
                 collapsed=False,
             )
             return
+
+        existing_token = str(self.job.get("checkout_lease_token") or "") or None
+        if existing_token and not CHECKOUT_LEASE_MANAGER.owns(repo=self.repo, token=existing_token):
+            self.job["checkout_lease_token"] = None
+            existing_token = None
+        if not existing_token:
+            try:
+                self.job["checkout_lease_token"] = CHECKOUT_LEASE_MANAGER.acquire(
+                    repo=self.repo,
+                    job_id=str(self.job.get("id") or self.job_dir.name),
+                    job_dir=self.job_dir,
+                )
+                self.save()
+            except Exception as exc:
+                self.job.update({"status": "BLOCKED", "task_status": "BLOCKED"})
+                self.save()
+                self.note(str(exc), title="REPO OWNERSHIP GUARD", collapsed=False)
+                return
 
         task, raw_user = self.task_text(resume)
         n = int(self.job.get("attempt", 0)) + 1
@@ -3314,11 +3832,25 @@ RESUME RULES:
         worker_env["AI_ORCH_DELEGATION_DEPTH"] = "0"
         worker_env["AI_ORCH_PROMPT_SHA256"] = str(self.job.get("prompt_sha256", ""))
         worker_env["AI_ORCH_MAX_DELEGATES_PER_JOB"] = str(self.job.get("max_delegates", 3))
-        worker_env["AI_ORCH_PERMISSION_PROFILE"] = str(self.job.get("permission_profile", self.permission_profile))
+        worker_env["AI_ORCH_PERMISSION_PROFILE"] = str(
+            self.job.get("permission_profile", self.permission_profile)
+        )
         if str(self.job.get("scope_mode", self.scope_mode)) == "strict":
             worker_env["AI_ORCH_STRICT_TASK"] = "1"
         else:
             worker_env.pop("AI_ORCH_STRICT_TASK", None)
+
+        journal = self._journal()
+        workflow = self._workflow_store()
+        if journal:
+            journal.append(
+                "main.worker_launch",
+                job_id=str(self.job.get("id") or ""),
+                run_number=n,
+                resume=bool(resume),
+            )
+        if workflow:
+            workflow.transition("main", "STARTING", run_number=n)
 
         self._last_main_output_at = now()
         self._last_proc_diag_at = 0.0
@@ -3326,16 +3858,57 @@ RESUME RULES:
         self._stall_notice_level = 0
         self._recovered_main_result_posted = False
 
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-            env=worker_env,
-        )
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+                env=worker_env,
+            )
+        except Exception:
+            self.job.update({"status": "PAUSED_RETRY", "resume_at": now() + 60})
+            self._release_checkout_lease()
+            self.save()
+            raise
+
         self.proc = proc
+        token = str(self.job.get("checkout_lease_token") or "")
+        if token:
+            try:
+                CHECKOUT_LEASE_MANAGER.refresh_worker(
+                    repo=self.repo,
+                    token=token,
+                    worker_pid=proc.pid,
+                )
+            except Exception as exc:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+                self.proc = None
+                self.job.update({
+                    "status": "BLOCKED",
+                    "task_status": "BLOCKED",
+                    "runtime_error": f"CHECKOUT_LEASE_LOST: {exc}",
+                })
+                self._release_checkout_lease()
+                self.save()
+                self.note(
+                    self.job["runtime_error"],
+                    title="REPO OWNERSHIP GUARD",
+                    collapsed=False,
+                )
+                return
         pgid = process_pgid(proc.pid) or proc.pid
         self.job["worker"] = {
             "pid": proc.pid,
@@ -3347,6 +3920,8 @@ RESUME RULES:
             "started_at": iso(),
         }
         self.save()
+        if workflow:
+            workflow.transition("main", "RUNNING", run_number=n, pid=proc.pid)
 
         self.raw.clear()
         scope = self.job.get("scope_mode", self.scope_mode)
@@ -3419,7 +3994,7 @@ RESUME RULES:
                 if cmd_health != "HEALTHY":
                     extra.append(f"CMD excluded: {cmd_health}")
             self.note(
-                f"source: {source}\n{pretty_router_panel(self.route)}"
+                f"source: {source}\n{pretty_router_panel(self.route, compact=self.ui_density != 'verbose')}"
                 + (("\n" + "\n".join(extra)) if extra else ""),
                 title="ROUTER",
                 collapsed=False,
@@ -3490,14 +4065,103 @@ RESUME RULES:
         rc = int(result.get("rc", msg.rc))
         status = _validated_task_status(reported_status, rc)
         combined = "\n".join(self.raw[-1200:]) + "\n" + str(result.get("stderr_text") or "")
-        if rc != 0 and reported_status == "COMPLETE":
+        if rc != 0 and reported_status and callable(getattr(self, "note", None)):
             self.note(
-                f"Ignoring reported COMPLETE because ai-orch exited with rc={rc}.",
+                f"Ignoring reported task status {reported_status} because process rc={rc}.",
                 title="RUNTIME FAILURE",
                 collapsed=False,
             )
+
         self.proc = None
         self._mark_main_worker_finished(rc)
+
+        durable_enabled = bool(
+            getattr(self, "job_dir", None)
+            and isinstance((self.job or {}).get("project_binding"), dict)
+        )
+        journal = self._journal() if durable_enabled else None
+        workflow = self._workflow_store() if durable_enabled else None
+        try:
+            if journal:
+                journal.append(
+                    "main.process_terminal",
+                    job_id=str((self.job or {}).get("id") or ""),
+                    rc=rc,
+                    reported_status=reported_status,
+                    result_file=str(msg.result),
+                )
+            if workflow:
+                workflow.transition(
+                    "main",
+                    "COMPLETE" if rc == 0 else "FAILED",
+                    rc=rc,
+                    task_status=status,
+                )
+        except Exception as exc:
+            self.note(
+                f"Durable runtime update failed: {exc}",
+                title="RUNTIME INTEGRITY",
+                collapsed=False,
+            )
+            if status == "COMPLETE":
+                status = "BLOCKED"
+
+        if status == "COMPLETE" and self.job is not None and self.job_dir is not None and journal is not None:
+            try:
+                if workflow:
+                    workflow.transition("verify", "RUNNING")
+                verification = verify_completion(
+                    job=self.job,
+                    job_dir=self.job_dir,
+                    repo=self.repo,
+                    reported_status=reported_status,
+                    rc=rc,
+                    journal=journal,
+                )
+                audit = verification.as_dict()
+                self.job["verification_v14"] = audit
+                GoalStore(self.job_dir).set_completion_audit(
+                    {"accepted": verification.accepted, **audit}
+                )
+                journal.append(
+                    "verification.completed",
+                    job_id=str(self.job.get("id") or ""),
+                    accepted=verification.accepted,
+                    checks=audit.get("checks"),
+                    errors=audit.get("errors"),
+                    warnings=audit.get("warnings"),
+                )
+                if workflow:
+                    workflow.transition(
+                        "verify",
+                        "COMPLETE" if verification.accepted else "FAILED",
+                        errors=verification.errors,
+                        warnings=verification.warnings,
+                    )
+                if not verification.accepted:
+                    status = "BLOCKED"
+                    self.note(
+                        "MAIN claimed COMPLETE, but verification rejected it:\n- "
+                        + "\n- ".join(verification.errors),
+                        title="COMPLETE CLAIM REJECTED",
+                        collapsed=False,
+                    )
+            except Exception as exc:
+                status = "BLOCKED"
+                self.job["verification_v14"] = {
+                    "accepted": False,
+                    "errors": [repr(exc)],
+                }
+                self.note(
+                    f"Verification gate could not prove completion: {exc}",
+                    title="COMPLETE CLAIM REJECTED",
+                    collapsed=False,
+                )
+
+        # The process is now terminal and verification has run while ownership was
+        # still held. Release only after those checks, never before.
+        if durable_enabled:
+            self._release_checkout_lease()
         self._recovered_main_result_posted = False
 
         if response:
@@ -3516,12 +4180,8 @@ RESUME RULES:
         requested_state = str(self.job.get("status") or "")
         self.job["task_status"] = status
         if requested_state in {"PAUSED_USER", "CANCELLED"}:
-            # A user pause/cancel is authoritative even if the terminated worker
-            # races to produce a final result while SIGTERM is being delivered.
             self.job["status"] = requested_state
             if requested_state == "PAUSED_USER" and self.job.get("steer_pending"):
-                # A steer intentionally terminates the old MAIN. Resume only after
-                # its late result has been consumed so it cannot overwrite the steer.
                 self.job["steer_pending"] = False
                 self.job["status"] = "PAUSED_RETRY"
                 self.job["resume_at"] = now() + 0.25
@@ -3660,6 +4320,10 @@ RESUME RULES:
             "HELP",
             "HISTORY",
             "JOB",
+            "GOAL",
+            "TODO",
+            "JOURNAL",
+            "RUNTIME",
             "SESSION",
             "CURRENT PROMPT",
             "QUOTA",
@@ -3747,7 +4411,8 @@ RESUME RULES:
                     state = "RUN"
             else:
                 state = "done"
-            main = f"MAIN {a.model} · {state} · {a.elapsed()}"
+            model_text = compact_model_status(a.model) if self.ui_density == "compact" else a.model
+            main = f"MAIN {model_text} · {state} · {a.elapsed()}"
 
         current_job = (self.job or {}).get("id")
         delegates = [
@@ -3773,7 +4438,13 @@ RESUME RULES:
         if delegates:
             parts.append(f"delegates {active} active / {complete} complete / {len(delegates)} total")
         if self.attempts and self.attempts[-1].quota_summary and self.attempts[-1].ended is not None:
-            parts.append(f"quota {self.attempts[-1].quota_summary}")
+            quota_text = (
+                compact_quota_summary(self.attempts[-1].quota_summary)
+                if self.ui_density == "compact"
+                else self.attempts[-1].quota_summary
+            )
+            if quota_text:
+                parts.append(f"quota {quota_text}")
 
         dock.update("  " + "   ·   ".join(parts) if parts else "  AGENTS idle")
 
@@ -4263,16 +4934,24 @@ RESUME RULES:
             self._queue_tick()
             return
 
+        branch_plan = self._branch_next_plan()
         try:
-            self._branch_apply_plan(self._branch_next_plan())
+            self.new_job(
+                prompt,
+                attachments=attachments,
+                branch_plan=branch_plan,
+            )
         except Exception as e:
-            self.note(f"브랜치 준비 실패: {e}\n프롬프트는 입력창에 그대로 유지했습니다.", title="BRANCH ERROR", collapsed=False)
+            self.note(
+                f"작업 시작 실패: {e}\n프롬프트는 입력창에 그대로 유지했습니다.",
+                title="RUNTIME FAILURE",
+                collapsed=False,
+            )
             return
         self._branch_consume_pending()
         box.load_text("")
         self.pending_attachments.clear()
         self.update_commandbar()
-        self.new_job(prompt, attachments=attachments)
         self._remember_submit(prompt, attachments)
 
     def command(self, text: str) -> None:
@@ -4453,6 +5132,17 @@ RESUME RULES:
             else:
                 self.note("usage: /verbose normal|verbose|trace", title="HELP")
 
+        elif cmd == "/ui":
+            mode = p[1].lower() if len(p) >= 2 else self.ui_density
+            if mode not in {"compact", "verbose"}:
+                self.note("usage: /ui compact|verbose", title="HELP", collapsed=False)
+            else:
+                self.ui_density = mode
+                self._save_tui_state()
+                self.update_banner()
+                self.update_agentdock()
+                self.note(f"UI density · {mode}", title="DISPLAY")
+
         elif cmd in {"/details", "/detail"}:
             self.action_details()
 
@@ -4521,6 +5211,169 @@ RESUME RULES:
                 title="JOB",
                 collapsed=False,
             )
+
+        elif cmd == "/goal":
+            if not self.job_dir:
+                self.note("No active job.", title="GOAL", collapsed=False)
+            else:
+                goal = GoalStore(self.job_dir).read_goal()
+                self.note(
+                    json.dumps(goal, ensure_ascii=False, indent=2),
+                    title="GOAL",
+                    collapsed=False,
+                )
+
+        elif cmd == "/todo":
+            if not self.job_dir:
+                self.note("No active job.", title="TODO", collapsed=False)
+            elif len(p) >= 2 and p[1].lower() == "add":
+                item_text = text.split(None, 2)[2].strip() if len(p) >= 3 else ""
+                if not item_text:
+                    self.note("usage: /todo add <text>", title="HELP", collapsed=False)
+                else:
+                    item = GoalStore(self.job_dir).add_todo(item_text)
+                    self.note(
+                        f"todo added · {item.get('todo_id')} · {item.get('text')}",
+                        title="TODO",
+                        collapsed=False,
+                    )
+            else:
+                todo = GoalStore(self.job_dir).read_todo()
+                self.note(
+                    json.dumps(todo, ensure_ascii=False, indent=2),
+                    title="TODO",
+                    collapsed=False,
+                )
+
+        elif cmd == "/journal":
+            journal = self._journal()
+            if not journal or not journal.path.exists():
+                self.note("No durable journal for the current job.", title="JOURNAL", collapsed=False)
+            else:
+                try:
+                    ok, reason = journal.verify()
+                    rows = journal.read() if ok else []
+                    tail = rows[-20:]
+                    self.note(
+                        f"integrity: {'PASS' if ok else 'FAIL'} · {reason}\n"
+                        + "\n".join(
+                            f"{row.get('seq')} · {row.get('event')} · {row.get('timestamp')}"
+                            for row in tail
+                        ),
+                        title="JOURNAL",
+                        collapsed=False,
+                    )
+                except Exception as exc:
+                    self.note(str(exc), title="JOURNAL", collapsed=False)
+
+        elif cmd == "/runtime":
+            if not self.job or not self.job_dir:
+                self.note("No active durable runtime.", title="RUNTIME", collapsed=False)
+            else:
+                binding_ok, binding_reason = self._job_binding_ok()
+                journal = self._journal()
+                journal_ok, journal_reason = (journal.verify() if journal and journal.path.exists() else (False, "missing"))
+                unresolved = []
+                if journal and journal_ok:
+                    unresolved = journal.unresolved_intents()
+                workflow = self._workflow_store()
+                workflow_data = {}
+                if workflow and workflow.path.exists():
+                    try:
+                        workflow_data = json.loads(workflow.path.read_text())
+                    except Exception:
+                        workflow_data = {}
+                self.note(
+                    "binding: " + ("PASS" if binding_ok else "FAIL") + f" · {binding_reason}\n"
+                    "journal: " + ("PASS" if journal_ok else "FAIL") + f" · {journal_reason}\n"
+                    f"unresolved_side_effects: {len(unresolved)}\n"
+                    f"checkout_lease: {'held' if self.job.get('checkout_lease_token') else 'released'}\n"
+                    f"workflow_owner: {workflow_data.get('owner') or '-'}",
+                    title="RUNTIME",
+                    collapsed=False,
+                )
+
+        elif cmd == "/reconcile":
+            if not self.job or not self.job_dir:
+                self.note("No active job.", title="RECONCILE", collapsed=False)
+            elif len(p) < 3 or p[2].lower() not in {"success", "not-run", "failed"}:
+                self.note(
+                    "usage: /reconcile <intent-id> <success|not-run|failed>",
+                    title="HELP",
+                    collapsed=False,
+                )
+            else:
+                intent_id = p[1]
+                outcome = p[2].lower()
+                journal = self._journal()
+                assert journal is not None
+                try:
+                    unresolved = {
+                        str(row.get("intent_id") or ""): row
+                        for row in journal.unresolved_intents()
+                    }
+                except Exception as exc:
+                    self.note(str(exc), title="RECONCILE", collapsed=False)
+                    return
+                if intent_id not in unresolved:
+                    self.note(
+                        f"Intent {intent_id} is not currently unresolved.",
+                        title="RECONCILE",
+                        collapsed=False,
+                    )
+                else:
+                    journal.terminal(
+                        intent_id,
+                        outcome,
+                        reconciled_by="user",
+                        reconciled_at=iso(),
+                    )
+                    remaining = journal.unresolved_intents()
+                    if remaining:
+                        self.note(
+                            f"Reconciled {intent_id}; {len(remaining)} unresolved intent(s) remain.",
+                            title="RECONCILE",
+                            collapsed=False,
+                        )
+                    else:
+                        token = str(self.job.get("checkout_lease_token") or "")
+                        if token:
+                            try:
+                                CHECKOUT_LEASE_MANAGER.clear_quarantine(
+                                    repo=self.repo,
+                                    token=token,
+                                )
+                                CHECKOUT_LEASE_MANAGER.release(
+                                    repo=self.repo,
+                                    token=token,
+                                    allow_quarantine=True,
+                                )
+                                self.job["checkout_lease_token"] = None
+                            except Exception as exc:
+                                self.note(
+                                    f"Side effect is reconciled, but checkout quarantine could not be cleared: {exc}",
+                                    title="RECONCILE",
+                                    collapsed=False,
+                                )
+                                return
+                        self.job["checkout_quarantine"] = None
+                        self.job["runtime_error"] = None
+                        self.job["status"] = "PAUSED_USER"
+                        self.job["task_status"] = None
+                        self.job["resume_at"] = None
+                        journal.append(
+                            "runtime.user_reconciled",
+                            job_id=str(self.job.get("id") or ""),
+                            intent_id=intent_id,
+                            outcome=outcome,
+                        )
+                        self.save()
+                        self.update_banner()
+                        self.note(
+                            f"Reconciled {intent_id} as {outcome}. Checkout quarantine cleared. Use /resume to continue.",
+                            title="RECONCILE",
+                            collapsed=False,
+                        )
 
         elif cmd == "/session":
             if self.job and self.job_dir:
@@ -4839,7 +5692,7 @@ RESUME RULES:
             decision, route = self._latest_router_lines()
             text_out = (
                 f"decision: {decision or 'not available'}\n"
-                f"route:\n{pretty_router_panel(route) if route else 'not available'}\n"
+                f"route:\n{pretty_router_panel(route, compact=self.ui_density != 'verbose') if route else 'not available'}\n"
                 f"CMD global: {self._global_cmd_health_summary()}"
             )
             self.note(text_out, title="DECISION", collapsed=False)

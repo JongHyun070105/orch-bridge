@@ -21,8 +21,8 @@ DEFAULT_MODELS = {
     "gemini_high": "gemini-3.8-flash-high",
     "claude_sonnet": "claude-sonnet-5-5",
     "claude_opus": "claude-opus-5-5",
-    "sonnet": "claude-sonnet-4-6-thinking",
-    "opus": "claude-opus-4-6-thinking",
+    "sonnet": "claude-sonnet-5-5",
+    "opus": "claude-opus-5-5",
 }
 PROVIDER_BINARIES = {
     "codex": "codex",
@@ -54,6 +54,8 @@ def defaults() -> dict[str, Any]:
 LEGACY_CLAUDE_MODEL_ALIASES = {
     "claude_sonnet": {"sonnet", "claude-sonnet-5", "claude-sonnet-5-0"},
     "claude_opus": {"opus", "claude-opus-5", "claude-opus-5-0"},
+    "sonnet": {"sonnet", "claude-sonnet-4-6-thinking"},
+    "opus": {"opus", "claude-opus-4-6-thinking"},
 }
 
 
