@@ -566,6 +566,8 @@ def _compact_route_part(part: str) -> str:
     raw = re.sub(r"\s*·?\s*subscription\s*\([^)]*\)", "", raw, flags=re.I)
     raw = re.sub(r"\s*·?\s*subscription\b", "", raw, flags=re.I)
     raw = re.sub(r"\([^)]*\bu=[^)]*\)", "", raw)
+    if score:
+        raw = re.sub(r"\s*\([-+]?\d+(?:\.\d+)?\)\s*$", "", raw)
     label = pretty_route(raw).strip(" ·")
     label = re.sub(r"\s{2,}", " ", label)
     return f"{label} ({score})" if score else label
@@ -1937,10 +1939,10 @@ class OrchBridgeApp(App):
 
     def _current_project_binding(self, prompt_sha: str) -> dict[str, Any]:
         return build_project_binding(
-            repo=self.repo,
+            repo=getattr(self, "repo", REPO_DEFAULT),
             workspace_id=WORKSPACE_ID or os.getenv("AI_ORCH_WORKSPACE_ID"),
             project_base=PROJECT_BASE,
-            project_name=PROJECT_NAME or os.getenv("AI_ORCH_PROJECT_NAME") or self.repo.name,
+            project_name=PROJECT_NAME or os.getenv("AI_ORCH_PROJECT_NAME") or getattr(self, "repo", REPO_DEFAULT).name,
             prompt_sha256=prompt_sha,
         )
 
@@ -3905,7 +3907,7 @@ RESUME RULES:
         rc = int(result.get("rc", msg.rc))
         status = _validated_task_status(reported_status, rc)
         combined = "\n".join(self.raw[-1200:]) + "\n" + str(result.get("stderr_text") or "")
-        if rc != 0 and reported_status:
+        if rc != 0 and reported_status and callable(getattr(self, "note", None)):
             self.note(
                 f"Ignoring reported task status {reported_status} because process rc={rc}.",
                 title="RUNTIME FAILURE",
@@ -3915,8 +3917,12 @@ RESUME RULES:
         self.proc = None
         self._mark_main_worker_finished(rc)
 
-        journal = self._journal()
-        workflow = self._workflow_store()
+        durable_enabled = bool(
+            getattr(self, "job_dir", None)
+            and isinstance((self.job or {}).get("project_binding"), dict)
+        )
+        journal = self._journal() if durable_enabled else None
+        workflow = self._workflow_store() if durable_enabled else None
         try:
             if journal:
                 journal.append(
@@ -3996,7 +4002,8 @@ RESUME RULES:
 
         # The process is now terminal and verification has run while ownership was
         # still held. Release only after those checks, never before.
-        self._release_checkout_lease()
+        if durable_enabled:
+            self._release_checkout_lease()
         if self.job is not None:
             self.save()
         self._recovered_main_result_posted = False
