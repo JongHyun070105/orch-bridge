@@ -3810,14 +3810,100 @@ RESUME RULES:
         rc = int(result.get("rc", msg.rc))
         status = _validated_task_status(reported_status, rc)
         combined = "\n".join(self.raw[-1200:]) + "\n" + str(result.get("stderr_text") or "")
-        if rc != 0 and reported_status == "COMPLETE":
+        if rc != 0 and reported_status:
             self.note(
-                f"Ignoring reported COMPLETE because ai-orch exited with rc={rc}.",
+                f"Ignoring reported task status {reported_status} because process rc={rc}.",
                 title="RUNTIME FAILURE",
                 collapsed=False,
             )
+
         self.proc = None
         self._mark_main_worker_finished(rc)
+
+        journal = self._journal()
+        workflow = self._workflow_store()
+        try:
+            if journal:
+                journal.append(
+                    "main.process_terminal",
+                    job_id=str((self.job or {}).get("id") or ""),
+                    rc=rc,
+                    reported_status=reported_status,
+                    result_file=str(msg.result),
+                )
+            if workflow:
+                workflow.transition(
+                    "main",
+                    "COMPLETE" if rc == 0 else "FAILED",
+                    rc=rc,
+                    task_status=status,
+                )
+        except Exception as exc:
+            self.note(
+                f"Durable runtime update failed: {exc}",
+                title="RUNTIME INTEGRITY",
+                collapsed=False,
+            )
+            if status == "COMPLETE":
+                status = "BLOCKED"
+
+        if status == "COMPLETE" and self.job is not None and self.job_dir is not None and journal is not None:
+            try:
+                if workflow:
+                    workflow.transition("verify", "RUNNING")
+                verification = verify_completion(
+                    job=self.job,
+                    job_dir=self.job_dir,
+                    repo=self.repo,
+                    reported_status=reported_status,
+                    rc=rc,
+                    journal=journal,
+                )
+                audit = verification.as_dict()
+                self.job["verification_v14"] = audit
+                GoalStore(self.job_dir).set_completion_audit(
+                    {"accepted": verification.accepted, **audit}
+                )
+                journal.append(
+                    "verification.completed",
+                    job_id=str(self.job.get("id") or ""),
+                    accepted=verification.accepted,
+                    checks=audit.get("checks"),
+                    errors=audit.get("errors"),
+                    warnings=audit.get("warnings"),
+                )
+                if workflow:
+                    workflow.transition(
+                        "verify",
+                        "COMPLETE" if verification.accepted else "FAILED",
+                        errors=verification.errors,
+                        warnings=verification.warnings,
+                    )
+                if not verification.accepted:
+                    status = "BLOCKED"
+                    self.note(
+                        "MAIN claimed COMPLETE, but verification rejected it:\n- "
+                        + "\n- ".join(verification.errors),
+                        title="COMPLETE CLAIM REJECTED",
+                        collapsed=False,
+                    )
+            except Exception as exc:
+                status = "BLOCKED"
+                self.job["verification_v14"] = {
+                    "accepted": False,
+                    "errors": [repr(exc)],
+                }
+                self.note(
+                    f"Verification gate could not prove completion: {exc}",
+                    title="COMPLETE CLAIM REJECTED",
+                    collapsed=False,
+                )
+
+        # The process is now terminal and verification has run while ownership was
+        # still held. Release only after those checks, never before.
+        self._release_checkout_lease()
+        if self.job is not None:
+            self.save()
         self._recovered_main_result_posted = False
 
         if response:
@@ -3836,12 +3922,8 @@ RESUME RULES:
         requested_state = str(self.job.get("status") or "")
         self.job["task_status"] = status
         if requested_state in {"PAUSED_USER", "CANCELLED"}:
-            # A user pause/cancel is authoritative even if the terminated worker
-            # races to produce a final result while SIGTERM is being delivered.
             self.job["status"] = requested_state
             if requested_state == "PAUSED_USER" and self.job.get("steer_pending"):
-                # A steer intentionally terminates the old MAIN. Resume only after
-                # its late result has been consumed so it cannot overwrite the steer.
                 self.job["steer_pending"] = False
                 self.job["status"] = "PAUSED_RETRY"
                 self.job["resume_at"] = now() + 0.25
