@@ -3994,7 +3994,7 @@ RESUME RULES:
                 if cmd_health != "HEALTHY":
                     extra.append(f"CMD excluded: {cmd_health}")
             self.note(
-                f"source: {source}\n{pretty_router_panel(self.route, compact=self.ui_density != "verbose")}"
+                f"source: {source}\n{pretty_router_panel(self.route, compact=self.ui_density != 'verbose')}"
                 + (("\n" + "\n".join(extra)) if extra else ""),
                 title="ROUTER",
                 collapsed=False,
