@@ -19,7 +19,7 @@ from textual.binding import Binding
 from textual.command import CommandPalette
 from textual.containers import VerticalScroll
 from textual.message import Message
-from textual.widgets import Collapsible, Footer, RichLog, Static, TextArea
+from textual.widgets import Collapsible, RichLog, Static, TextArea
 
 from desktop_notify import backend_status as desktop_notify_backend_status, send_notification
 from platform_support import copy_text
@@ -30,6 +30,20 @@ from orch_runtime import (
     load_json as runtime_load_json,
     process_pgid,
     write_main_lease,
+)
+
+from orch_kernel import (
+    EventJournal,
+    GoalStore,
+    MainCheckoutLeaseManager,
+    ObserverEngine,
+    RepoIdentity,
+    WorkflowStore,
+    binding_digest,
+    build_project_binding,
+    find_live_prompt_collision,
+    validate_project_binding,
+    verify_completion,
 )
 
 HOME = Path.home()
@@ -108,6 +122,7 @@ DELEGATION_EVENTS_FILE = PROJECT_BASE / "delegations/events.jsonl"
 DELEGATION_REGISTRY_DB = PROJECT_BASE / "delegations/registry.sqlite3"
 WORKER = APP_DIR / "ai_job_worker.py"
 UPDATE_MANAGER = APP_DIR / "ai_update_manager.py"
+CHECKOUT_LEASE_MANAGER = MainCheckoutLeaseManager(BASE / "global/main-checkout-leases")
 VERSION_FILE = BASE / "VERSION.json"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 (PROJECT_BASE / "delegations").mkdir(parents=True, exist_ok=True)
@@ -272,8 +287,8 @@ SLASH_COMMANDS = [
     ("/model auto", "작업에 맞게 모델 자동 선택"),
     ("/model cmd", "MiMo V2.5 Pro로 모델 고정"),
     ("/model codex", "GPT-6 Luna로 모델 고정"),
-    ("/model sonnet", "AGY Claude Sonnet 4.6 Thinking으로 모델 고정"),
-    ("/model opus", "AGY Claude Opus 4.6 Thinking으로 모델 고정"),
+    ("/model sonnet", "AGY Claude Sonnet 5.5으로 모델 고정"),
+    ("/model opus", "AGY Claude Opus 5.5으로 모델 고정"),
     ("/model claude", "Claude.ai 구독 Claude Code Sonnet 5.5로 모델 고정"),
     ("/model claude-opus", "Claude.ai 구독 Claude Code Opus 5.5로 모델 고정"),
     ("/model gemini-low", "Gemini 3.8 Flash low로 모델 고정"),
@@ -517,8 +532,8 @@ def pretty_route(route: str) -> str:
         "codex": _codex_display_name(),
         "claude-sonnet": "Claude Code Sonnet 5.5",
         "claude-opus": "Claude Code Opus 5.5",
-        "sonnet": "AGY Claude Sonnet 4.6 Thinking",
-        "opus": "AGY Claude Opus 4.6 Thinking",
+        "sonnet": "AGY Claude Sonnet 5.5",
+        "opus": "AGY Claude Opus 5.5",
         "gemini-high": "Gemini 3.8 Flash · high",
         "gemini-medium": "Gemini 3.8 Flash · medium",
         "gemini-low": "Gemini 3.8 Flash · low",
@@ -530,9 +545,53 @@ def pretty_route(route: str) -> str:
     return out
 
 
-def pretty_router_panel(route: str) -> str:
+def _route_score(part: str) -> str | None:
+    raw = str(part or "")
+    legacy = re.search(r"(?:^|[,\s])u=([-+]?\d+(?:\.\d+)?)", raw)
+    if legacy:
+        return legacy.group(1)
+    trailing = re.search(r"\(([-+]?\d+(?:\.\d+)?)\)\s*$", raw)
+    return trailing.group(1) if trailing else None
+
+
+def _compact_route_part(part: str) -> str:
+    raw = str(part or "").strip()
+    score = _route_score(raw)
+    raw = re.sub(r"\s*·?\s*subscription\s*\([^)]*\)", "", raw, flags=re.I)
+    raw = re.sub(r"\s*·?\s*subscription\b", "", raw, flags=re.I)
+    raw = re.sub(r"\([^)]*\bu=[^)]*\)", "", raw)
+    label = pretty_route(raw).strip(" ·")
+    label = re.sub(r"\s{2,}", " ", label)
+    return f"{label} ({score})" if score else label
+
+
+def compact_route(route: str) -> str:
     parts = [x.strip() for x in str(route or "").split(" > ") if x.strip()]
-    return "\n".join(f"{i}. {pretty_route(part)}" for i, part in enumerate(parts, 1)) or "no viable candidates reported"
+    return " > ".join(_compact_route_part(part) for part in parts)
+
+
+def compact_model_status(model: str) -> str:
+    text = re.sub(r"\s*·\s*subscription\b", "", str(model or ""), flags=re.I)
+    return re.sub(r"\s{2,}", " ", text).strip(" ·")
+
+
+def compact_quota_summary(summary: str) -> str:
+    text = str(summary or "")
+    hits = re.findall(
+        r"(?i)\b(5h|7d|wk|week|month(?:ly)?)\s*[:=]?\s*(\d{1,3}(?:\.\d+)?)%",
+        text,
+    )
+    if hits:
+        return " · ".join(f"{name} {pct}%" for name, pct in hits)
+    text = re.sub(r"(?i)\s*·?\s*reset\s+[^·]+", "", text)
+    text = re.sub(r"(?i)\s*·?\s*cached\b.*$", "", text)
+    return re.sub(r"\s{2,}", " ", text).strip(" ·")
+
+
+def pretty_router_panel(route: str, *, compact: bool = True) -> str:
+    parts = [x.strip() for x in str(route or "").split(" > ") if x.strip()]
+    formatter = _compact_route_part if compact else pretty_route
+    return "\n".join(f"{i}. {formatter(part)}" for i, part in enumerate(parts, 1)) or "no viable candidates reported"
 
 
 def router_decision_source(decision: str) -> str:
@@ -894,10 +953,6 @@ class OrchBridgeApp(App):
         border: round #7aa2f7;
     }
 
-    Footer {
-        background: #11151b;
-        color: #8f9aaa;
-    }
     """
 
     BINDINGS = [
@@ -925,6 +980,7 @@ class OrchBridgeApp(App):
         self.attempts: list[Attempt] = []
         self.current: Attempt | None = None
         self.verbosity = "normal"
+        self.ui_density = "compact"
         self.route = ""
         self.router_decision = ""
         self.route_excluded = ""
@@ -2353,8 +2409,8 @@ class OrchBridgeApp(App):
             "cmd": "MiMo V2.5 Pro",
             "claude-sonnet": "Claude Code Sonnet 5.5 · subscription",
             "claude-opus": "Claude Code Opus 5.5 · subscription",
-            "sonnet": "AGY Claude Sonnet 4.6 Thinking",
-            "opus": "AGY Claude Opus 4.6 Thinking",
+            "sonnet": "AGY Claude Sonnet 5.5",
+            "opus": "AGY Claude Opus 5.5",
             "gemini-low": "Gemini 3.8 Flash · low",
             "gemini-medium": "Gemini 3.8 Flash · medium",
             "gemini-high": "Gemini 3.8 Flash · high",
@@ -2716,9 +2772,7 @@ class OrchBridgeApp(App):
         yield VerticalScroll(id="feed")
         yield Static("No active agents", id="agentdock")
         yield Static("", id="commandbar")
-        yield Static("MESSAGE  ·  Enter send/queue  ·  Shift+Enter newline  ·  Ctrl+U clear  ·  Ctrl+Y copy  ·  / commands", id="composer-label")
         yield TextArea("", id="prompt", soft_wrap=True, show_line_numbers=False)
-        yield Footer()
 
     def on_mount(self) -> None:
         self.set_interval(1.0, self.tick)
