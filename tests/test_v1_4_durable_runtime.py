@@ -407,12 +407,16 @@ def test_journal_malformed_tail_is_integrity_failure(tmp_path: Path) -> None:
     assert "parse" in reason or "invalid journal" in reason
 
 
-def test_worker_parser_accepts_durable_lease_flags() -> None:
+def test_worker_parser_accepts_durable_lease_flags_and_imports() -> None:
+    import importlib
+
     worker = (APP / "ai_job_worker.py").read_text()
     for flag in ("--lease-file", "--job-id", "--run-number", "--prompt-sha"):
         assert flag in worker
-    assert "refresh_main_lease" in worker
-    assert "write_main_lease" in worker
+    assert "start_main_heartbeat" in worker
+    assert "finish_main_heartbeat" in worker
+    module = importlib.import_module("ai_job_worker")
+    assert callable(module.main)
 
 
 def test_checkout_lease_does_not_expire_live_launcher_by_age(tmp_path: Path) -> None:
