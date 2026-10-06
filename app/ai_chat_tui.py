@@ -1196,6 +1196,8 @@ class OrchBridgeApp(App):
         self.permission_profile = perm if perm in {"trusted", "guarded"} else "guarded"
         notify = str(data.get("notify_mode", "smart")).lower()
         self.notify_mode = notify if notify in {"smart", "all", "important", "off"} else "smart"
+        density = str(data.get("ui_density", "compact")).lower()
+        self.ui_density = density if density in {"compact", "verbose"} else "compact"
         plan = data.get("pending_branch_plan")
         self.pending_branch_plan = plan if isinstance(plan, dict) else None
 
@@ -1208,6 +1210,7 @@ class OrchBridgeApp(App):
                 "scope_mode": self.scope_mode,
                 "permission_profile": self.permission_profile,
                 "notify_mode": self.notify_mode,
+                "ui_density": self.ui_density,
                 "pending_branch_plan": self.pending_branch_plan,
                 "updated_at": iso(),
             },
@@ -1219,6 +1222,7 @@ class OrchBridgeApp(App):
             "router_enabled": self.router_enabled,
             "scope_mode": self.scope_mode,
             "permission_profile": self.permission_profile,
+            "ui_density": self.ui_density,
         }
 
 
@@ -1254,7 +1258,7 @@ class OrchBridgeApp(App):
         self.update_commandbar()
         after = self._current_runtime_state()
         changed = [
-            key for key in ("model_override", "router_enabled", "scope_mode", "permission_profile", "notify_mode")
+            key for key in ("model_override", "router_enabled", "scope_mode", "permission_profile", "notify_mode", "ui_density")
             if before.get(key) != after.get(key)
         ]
         changed_text = ", ".join(changed) if changed else "none"
@@ -2783,9 +2787,18 @@ class OrchBridgeApp(App):
     def update_banner(self) -> None:
         branch = git_branch(self.repo)
         job_state = self.job.get("status", "READY") if self.job else "READY"
+        project_label = self.repo.name
+        binding = (self.job or {}).get("project_binding")
+        if isinstance(binding, dict) and binding.get("project_name"):
+            project_label = str(binding.get("project_name"))
         self.query_one("#brand", Static).update(
-            f"  ORCHBRIDGE v{orchestrator_version()}   {job_state}   ·   {self.repo.name}   ·   {branch}"
+            f"  ORCHBRIDGE v{orchestrator_version()}   {job_state}   ·   {project_label}   ·   {branch}"
         )
+
+        if self.ui_density == "compact":
+            route = compact_route(self.route) if self.route else "AUTO"
+            self.query_one("#runtime", Static).update(f"  {route}")
+            return
 
         route = pretty_route(self.route) if self.route else "AUTO"
         active_scope = (
@@ -2793,11 +2806,7 @@ class OrchBridgeApp(App):
             if self.job and self.job.get("scope_mode")
             else self.scope_mode
         )
-        prompt_sha = (
-            str(self.job.get("prompt_sha256", ""))[:8]
-            if self.job
-            else "-"
-        )
+        prompt_sha = str(self.job.get("prompt_sha256", ""))[:8] if self.job else "-"
         mode = (
             f"router {'on' if self.router_enabled else 'off'}"
             f" · model {self.model_override}"
@@ -3801,7 +3810,8 @@ RESUME RULES:
                     state = "RUN"
             else:
                 state = "done"
-            main = f"MAIN {a.model} · {state} · {a.elapsed()}"
+            model_text = compact_model_status(a.model) if self.ui_density == "compact" else a.model
+            main = f"MAIN {model_text} · {state} · {a.elapsed()}"
 
         current_job = (self.job or {}).get("id")
         delegates = [
@@ -3827,7 +3837,13 @@ RESUME RULES:
         if delegates:
             parts.append(f"delegates {active} active / {complete} complete / {len(delegates)} total")
         if self.attempts and self.attempts[-1].quota_summary and self.attempts[-1].ended is not None:
-            parts.append(f"quota {self.attempts[-1].quota_summary}")
+            quota_text = (
+                compact_quota_summary(self.attempts[-1].quota_summary)
+                if self.ui_density == "compact"
+                else self.attempts[-1].quota_summary
+            )
+            if quota_text:
+                parts.append(f"quota {quota_text}")
 
         dock.update("  " + "   ·   ".join(parts) if parts else "  AGENTS idle")
 
