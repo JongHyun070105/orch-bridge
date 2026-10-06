@@ -3639,7 +3639,11 @@ RESUME RULES:
             )
             return
 
-        if not self.job.get("checkout_lease_token"):
+        existing_token = str(self.job.get("checkout_lease_token") or "") or None
+        if existing_token and not CHECKOUT_LEASE_MANAGER.owns(repo=self.repo, token=existing_token):
+            self.job["checkout_lease_token"] = None
+            existing_token = None
+        if not existing_token:
             try:
                 self.job["checkout_lease_token"] = CHECKOUT_LEASE_MANAGER.acquire(
                     repo=self.repo,
