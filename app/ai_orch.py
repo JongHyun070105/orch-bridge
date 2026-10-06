@@ -674,15 +674,15 @@ candidates = [
     Candidate("claude-sonnet", "Claude Code/Sonnet 5.5", "claude", "anthropic",
               claude_code_model("sonnet", models.get("claude_sonnet")),
               "claude-pro", .95, .46),
-    Candidate("sonnet", "AGY/Sonnet 4.6 Thinking", "agy", "anthropic",
-              models.get("sonnet", "claude-sonnet-4-6-thinking"),
+    Candidate("sonnet", "AGY/Sonnet 5.5", "agy", "anthropic",
+              models.get("sonnet", "claude-sonnet-5-5"),
               "third", .94, .50, third_q, third_reset),
     Candidate("codex", "Codex", "codex", "openai", None, None, .93, .62),
     Candidate("claude-opus", "Claude Code/Opus 5.5", "claude", "anthropic",
               claude_code_model("opus", models.get("claude_opus")),
               "claude-pro", .99, .90),
-    Candidate("opus", "AGY/Opus 4.6 Thinking", "agy", "anthropic",
-              models.get("opus", "claude-opus-4-6-thinking"),
+    Candidate("opus", "AGY/Opus 5.5", "agy", "anthropic",
+              models.get("opus", "claude-opus-5-5"),
               "third", .98, .88, third_q, third_reset),
 ]
 
@@ -1251,13 +1251,24 @@ def run_agy(prompt: str, model: str) -> Outcome:
     exe = resolve_provider_cli("agy", config)
     if not exe:
         return _missing_cli_outcome("agy")
-    argv = [
-        exe, "-p", prompt,
-        "--model", model,
+    argv = [exe, "-p", prompt, "--model", model]
+    if model.startswith("claude-"):
+        override = str(os.environ.get("AI_ORCH_AGY_CLAUDE_EFFORT", "")).strip().lower()
+        if override in {"low", "medium", "high"}:
+            effort = override
+        else:
+            pressure = max(
+                float(assessment.need), float(assessment.reasoning),
+                float(assessment.uncertainty), float(assessment.risk),
+            )
+            effort = "high" if pressure >= 0.78 else ("low" if pressure <= 0.38 else "medium")
+        argv.extend(["--effort", effort])
+        log(f"[{label}] effort={effort}")
+    argv.extend([
         "--output-format", "stream-json",
         "--dangerously-skip-permissions",
         "--print-timeout", "30m",
-    ]
+    ])
     proc = subprocess.Popen(
         argv, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1,
