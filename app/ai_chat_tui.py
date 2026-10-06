@@ -3170,6 +3170,87 @@ class OrchBridgeApp(App):
 
             self.job_dir, self.job = d, j
             self._recovered_main_result_posted = False
+
+            try:
+                recovered_prompt = (d / "original-prompt.md").read_text()
+            except Exception:
+                recovered_prompt = ""
+            prompt_sha = self._prompt_sha(recovered_prompt) if recovered_prompt else ""
+
+            # Safe one-time migration for public v1.3 jobs: context equality was
+            # already proven above, and the original prompt hash must still agree.
+            if not isinstance(j.get("project_binding"), dict):
+                if not recovered_prompt or str(j.get("prompt_sha256") or "") != prompt_sha:
+                    j["status"] = "BLOCKED"
+                    j["task_status"] = "BLOCKED"
+                    j["binding_error"] = "PROJECT_BINDING_MISMATCH: legacy prompt cannot be proven"
+                    self.save()
+                    self.note(j["binding_error"], title="PROJECT BINDING GUARD", collapsed=False)
+                    break
+                binding = self._current_project_binding(prompt_sha)
+                j["project_binding"] = binding
+                j["binding_sha256"] = binding_digest(binding)
+                j["schema_version"] = max(3, int(j.get("schema_version") or 0))
+                self._initialize_durable_runtime(recovered_prompt)
+                journal = self._journal()
+                if journal:
+                    journal.append(
+                        "runtime.legacy_binding_migrated",
+                        job_id=str(j.get("id") or d.name),
+                        from_schema=int(j.get("schema_version") or 0),
+                    )
+                self.save()
+
+            binding_ok, binding_reason = self._job_binding_ok()
+            if not binding_ok:
+                j["status"] = "BLOCKED"
+                j["task_status"] = "BLOCKED"
+                j["binding_error"] = binding_reason
+                self._release_checkout_lease()
+                self.save()
+                self.note(binding_reason, title="PROJECT BINDING GUARD", collapsed=False)
+                break
+
+            proposal = ObserverEngine.repo_identity_proposal(
+                repo=self.repo,
+                binding=j.get("project_binding") or {},
+            )
+            if proposal.get("action") != "ALLOW":
+                j["status"] = "BLOCKED"
+                j["task_status"] = "BLOCKED"
+                j["binding_error"] = str(proposal.get("reason") or "REPO_IDENTITY_MISMATCH")
+                self._release_checkout_lease()
+                self.save()
+                self.note(j["binding_error"], title="REPO OBSERVER", collapsed=False)
+                break
+
+            journal = self._journal()
+            if journal and journal.path.exists():
+                ok, reason = journal.verify()
+                if not ok:
+                    j["status"] = "BLOCKED"
+                    j["task_status"] = "BLOCKED"
+                    j["runtime_error"] = "V14_JOURNAL_INTEGRITY_FAILURE: " + reason
+                    self._release_checkout_lease()
+                    self.save()
+                    self.note(j["runtime_error"], title="RUNTIME INTEGRITY", collapsed=False)
+                    break
+                unresolved = journal.unresolved_intents()
+                if unresolved:
+                    j["status"] = "NEEDS_USER"
+                    j["task_status"] = "NEEDS_USER"
+                    j["runtime_error"] = (
+                        f"V14_UNRESOLVED_SIDE_EFFECT: {len(unresolved)} intent(s) require reconciliation"
+                    )
+                    self._release_checkout_lease()
+                    self.save()
+                    self.note(
+                        j["runtime_error"],
+                        title="RUNTIME RECOVERY",
+                        collapsed=False,
+                    )
+                    break
+
             changed = False
             recovery_detail = ""
 
@@ -3199,12 +3280,18 @@ class OrchBridgeApp(App):
             if changed:
                 self.save()
 
-            try:
-                recovered_prompt = (d / "original-prompt.md").read_text()
-            except Exception:
-                recovered_prompt = ""
             if recovered_prompt:
                 self._mount_user_message(recovered_prompt)
+
+            if journal:
+                try:
+                    journal.append(
+                        "runtime.recovered",
+                        job_id=str(j.get("id") or d.name),
+                        status=str(j.get("status") or ""),
+                    )
+                except Exception:
+                    pass
 
             msg = f"Recovered {j['id']} · {j['status']} · {j.get('title','task')}" + recovery_detail
             if self._recovery_grace_until and j["status"] != "RUNNING":
@@ -3212,7 +3299,6 @@ class OrchBridgeApp(App):
                     "\nStartup recovery grace: 15s. "
                     "A new prompt will not be allowed while a verified old MAIN worker is alive."
                 )
-
             self.note(msg, title="SESSION", collapsed=False)
             break
 
