@@ -553,7 +553,7 @@ def pretty_route(route: str) -> str:
 
 def _route_score(part: str) -> str | None:
     raw = str(part or "")
-    legacy = re.search(r"(?:^|[,\s])u=([-+]?\d+(?:\.\d+)?)", raw)
+    legacy = re.search(r"(?:^|[,(\s])u=([-+]?\d+(?:\.\d+)?)", raw)
     if legacy:
         return legacy.group(1)
     trailing = re.search(r"\(([-+]?\d+(?:\.\d+)?)\)\s*$", raw)
@@ -1961,7 +1961,16 @@ class OrchBridgeApp(App):
             return False, "PROJECT_BINDING_MISMATCH: queue prompt hash changed"
         binding = entry.get("project_binding")
         if not isinstance(binding, dict):
-            return False, "PROJECT_BINDING_MISMATCH: queue entry has no immutable binding"
+            # v1.3 project-local queues predate immutable bindings. Migrate only
+            # when the queue is already scoped by a registered workspace; never
+            # guess the owner of legacy global queue state.
+            if not WORKSPACE_ID or PROJECT_BASE.resolve() == BASE.resolve():
+                return False, "PROJECT_BINDING_MISMATCH: legacy global queue has no provable project binding"
+            binding = self._current_project_binding(prompt_sha)
+            entry["project_binding"] = binding
+            entry["binding_sha256"] = binding_digest(binding)
+            entry["binding_migrated_from"] = "v1.3-project-local"
+            self._save_queue_state()
         return self._validate_binding(
             binding,
             str(entry.get("binding_sha256") or "") or None,
@@ -3187,17 +3196,18 @@ class OrchBridgeApp(App):
                     self.save()
                     self.note(j["binding_error"], title="PROJECT BINDING GUARD", collapsed=False)
                     break
+                old_schema = int(j.get("schema_version") or 0)
                 binding = self._current_project_binding(prompt_sha)
                 j["project_binding"] = binding
                 j["binding_sha256"] = binding_digest(binding)
-                j["schema_version"] = max(3, int(j.get("schema_version") or 0))
+                j["schema_version"] = max(3, old_schema)
                 self._initialize_durable_runtime(recovered_prompt)
                 journal = self._journal()
                 if journal:
                     journal.append(
                         "runtime.legacy_binding_migrated",
                         job_id=str(j.get("id") or d.name),
-                        from_schema=int(j.get("schema_version") or 0),
+                        from_schema=old_schema,
                     )
                 self.save()
 
