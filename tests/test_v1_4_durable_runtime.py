@@ -42,7 +42,7 @@ def _repo(path: Path, name: str) -> Path:
     repo.mkdir()
     _git(repo, "init")
     _git(repo, "config", "user.name", "OrchBridge Test")
-    _git(repo, "config", "user.email", "orchbridge-test@example.invalid")
+    _git(repo, "config", "user.email", "orchbridge-test.invalid")
     (repo / "README.md").write_text("# test\n")
     _git(repo, "add", "README.md")
     _git(repo, "commit", "-m", "init")
@@ -174,6 +174,12 @@ def test_event_journal_detects_mutation_and_clean_tail_truncation(tmp_path: Path
     tail.path.write_text(tail.path.read_text().splitlines()[0] + "\n")
     ok, reason = tail.verify()
     assert not ok and "anchor" in reason
+
+    missing = EventJournal(tmp_path / "missing-anchor.jsonl")
+    missing.append("one")
+    missing.anchor_path.unlink()
+    ok, reason = missing.verify()
+    assert not ok and "anchor missing" in reason
 
 
 def test_side_effect_intent_requires_terminal_confirmation(tmp_path: Path) -> None:
