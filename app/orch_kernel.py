@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import uuid
@@ -273,6 +274,45 @@ def pid_alive(pid: int) -> bool:
         return False
 
 
+def process_command(pid: int) -> str | None:
+    if pid <= 1:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    command = proc.stdout.strip()
+    return command or None
+
+
+def worker_process_matches(data: dict[str, Any]) -> bool | None:
+    pid = int(data.get("worker_pid") or 0)
+    if pid <= 1 or not pid_alive(pid):
+        return False
+    command = process_command(pid)
+    if command is None:
+        return None
+    try:
+        argv = shlex.split(command)
+    except Exception:
+        argv = command.split()
+    if not any(Path(part).name == "ai_job_worker.py" for part in argv):
+        return False
+    try:
+        idx = argv.index("--job-id")
+        cmd_job = argv[idx + 1]
+    except (ValueError, IndexError):
+        return False
+    return cmd_job == str(data.get("job_id") or "")
+
+
 class MainCheckoutLeaseManager:
     """One durable writer owner per canonical Git checkout."""
 
@@ -285,34 +325,40 @@ class MainCheckoutLeaseManager:
         key = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:32]
         return self.root / f"{key}.json"
 
+    @staticmethod
+    def _job_status(data: dict[str, Any]) -> str:
+        job_dir_raw = str(data.get("job_dir") or "")
+        if not job_dir_raw:
+            return ""
+        job = load_json(Path(job_dir_raw) / "job.json", {})
+        return str(job.get("status") or "").upper() if isinstance(job, dict) else ""
+
     def _active(self, data: dict[str, Any]) -> bool:
         if bool(data.get("quarantined")):
             return True
-        worker_pid = int(data.get("worker_pid") or 0)
-        if pid_alive(worker_pid):
+
+        worker_match = worker_process_matches(data)
+        if worker_match is True:
             return True
-        launcher_pid = int(data.get("launcher_pid") or 0)
-        try:
-            age = max(0.0, now() - float(data.get("created_at_epoch") or 0))
-        except Exception:
-            age = 999.0
-        if pid_alive(launcher_pid) and age < 30.0:
+        if worker_match is None:
+            # ps inspection failed while the PID is alive. Fail closed rather
+            # than allowing a second writer.
             return True
 
-        # PREPARING/READY/RUNNING are retained until startup recovery
-        # reconciles them. This closes the crash window between durable state,
-        # branch side effects, and worker PID publication.
-        job_dir = Path(str(data.get("job_dir") or ""))
-        if job_dir:
-            job = load_json(job_dir / "job.json", {})
-            if isinstance(job, dict):
-                status = str(job.get("status") or "").upper()
-                if status in {"PREPARING", "READY", "RUNNING"}:
-                    return True
+        status = self._job_status(data)
+        launcher_pid = int(data.get("launcher_pid") or 0)
+        if status in {
+            "PREPARING", "READY", "RUNNING",
+            "PAUSED_QUOTA", "PAUSED_RETRY", "PAUSED_USER",
+        } and pid_alive(launcher_pid):
+            # A live launcher owns the lease until worker handoff or durable
+            # recovery changes the job state. Never expire it solely by age.
+            return True
         return False
 
     def acquire(self, *, repo: Path, job_id: str, job_dir: Path) -> str:
         path = self.path_for_repo(repo)
+        lock_path = path.with_suffix(".lock")
         token = uuid.uuid4().hex
         payload = {
             "schema": 1,
@@ -324,17 +370,10 @@ class MainCheckoutLeaseManager:
             "worker_pid": 0,
             "created_at": iso(),
             "created_at_epoch": now(),
+            "updated_at": iso(),
         }
-        for _ in range(2):
-            try:
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                try:
-                    os.write(fd, (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                return token
-            except FileExistsError:
+        with file_lock(lock_path):
+            if path.exists():
                 old = load_json(path, {})
                 if isinstance(old, dict) and self._active(old):
                     raise RuntimeError(
@@ -345,13 +384,16 @@ class MainCheckoutLeaseManager:
                     path.unlink()
                 except FileNotFoundError:
                     pass
-        raise RuntimeError("CHECKOUT_LEASE_BUSY: could not acquire checkout lease")
+            atomic_json(path, payload)
+        return token
 
     def owns(self, *, repo: Path, token: str | None) -> bool:
         if not token:
             return False
-        data = load_json(self.path_for_repo(repo), {})
-        return isinstance(data, dict) and str(data.get("token") or "") == str(token)
+        path = self.path_for_repo(repo)
+        with file_lock(path.with_suffix(".lock"), exclusive=False):
+            data = load_json(path, {})
+            return isinstance(data, dict) and str(data.get("token") or "") == str(token)
 
     def adopt(self, *, repo: Path, token: str) -> None:
         path = self.path_for_repo(repo)
@@ -363,6 +405,18 @@ class MainCheckoutLeaseManager:
                 raise RuntimeError("CHECKOUT_QUARANTINED")
             data["launcher_pid"] = os.getpid()
             data["created_at_epoch"] = now()
+            data["updated_at"] = iso()
+            atomic_json(path, data)
+
+    def refresh_launcher(self, *, repo: Path, token: str) -> None:
+        path = self.path_for_repo(repo)
+        with file_lock(path.with_suffix(".lock")):
+            data = load_json(path, {})
+            if not isinstance(data, dict) or str(data.get("token") or "") != str(token):
+                raise RuntimeError("CHECKOUT_LEASE_LOST")
+            if bool(data.get("quarantined")):
+                raise RuntimeError("CHECKOUT_QUARANTINED")
+            data["launcher_pid"] = os.getpid()
             data["updated_at"] = iso()
             atomic_json(path, data)
 
@@ -404,21 +458,22 @@ class MainCheckoutLeaseManager:
             atomic_json(path, data)
 
     def release(self, *, repo: Path, token: str | None, allow_quarantine: bool = False) -> bool:
+        if not token:
+            return False
         path = self.path_for_repo(repo)
-        if not path.exists():
-            return True
         with file_lock(path.with_suffix(".lock")):
+            if not path.exists():
+                return True
             data = load_json(path, {})
-            if token and isinstance(data, dict) and str(data.get("token") or "") != str(token):
+            if not isinstance(data, dict) or str(data.get("token") or "") != str(token):
                 return False
-            if isinstance(data, dict) and bool(data.get("quarantined")) and not allow_quarantine:
+            if bool(data.get("quarantined")) and not allow_quarantine:
                 return False
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
         return True
-
 
 def find_live_prompt_collision(
     jobs_dir: Path,
@@ -487,7 +542,10 @@ class EventJournal:
 
     def verify(self) -> tuple[bool, str]:
         with file_lock(self.lock_path, exclusive=False):
-            rows = self._read_unlocked()
+            try:
+                rows = self._read_unlocked()
+            except Exception as exc:
+                return False, f"journal parse/integrity failure: {exc}"
             prev_hash = "GENESIS"
             expected_seq = 1
             for idx, row in enumerate(rows, 1):
