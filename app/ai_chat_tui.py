@@ -323,6 +323,11 @@ SLASH_COMMANDS = [
 
     ("/jobs", "영구 작업 목록 보기"),
     ("/job", "현재 작업 메타데이터 보기"),
+    ("/goal", "현재 durable goal / completion audit 보기"),
+    ("/todo", "현재 durable todo 보기"),
+    ("/todo add <text>", "현재 작업 durable todo 추가"),
+    ("/journal", "현재 작업 event journal 상태 보기"),
+    ("/runtime", "binding / journal / workflow runtime 상태 보기"),
     ("/pause", "현재 작업 일시정지"),
     ("/resume", "일시정지된 작업 재개"),
     ("/retry", "현재 일시정지 작업 재시도 / 재개"),
@@ -4152,6 +4157,10 @@ RESUME RULES:
             "HELP",
             "HISTORY",
             "JOB",
+            "GOAL",
+            "TODO",
+            "JOURNAL",
+            "RUNTIME",
             "SESSION",
             "CURRENT PROMPT",
             "QUOTA",
@@ -5039,6 +5048,87 @@ RESUME RULES:
                 title="JOB",
                 collapsed=False,
             )
+
+        elif cmd == "/goal":
+            if not self.job_dir:
+                self.note("No active job.", title="GOAL", collapsed=False)
+            else:
+                goal = GoalStore(self.job_dir).read_goal()
+                self.note(
+                    json.dumps(goal, ensure_ascii=False, indent=2),
+                    title="GOAL",
+                    collapsed=False,
+                )
+
+        elif cmd == "/todo":
+            if not self.job_dir:
+                self.note("No active job.", title="TODO", collapsed=False)
+            elif len(p) >= 2 and p[1].lower() == "add":
+                item_text = text.split(None, 2)[2].strip() if len(p) >= 3 else ""
+                if not item_text:
+                    self.note("usage: /todo add <text>", title="HELP", collapsed=False)
+                else:
+                    item = GoalStore(self.job_dir).add_todo(item_text)
+                    self.note(
+                        f"todo added · {item.get('todo_id')} · {item.get('text')}",
+                        title="TODO",
+                        collapsed=False,
+                    )
+            else:
+                todo = GoalStore(self.job_dir).read_todo()
+                self.note(
+                    json.dumps(todo, ensure_ascii=False, indent=2),
+                    title="TODO",
+                    collapsed=False,
+                )
+
+        elif cmd == "/journal":
+            journal = self._journal()
+            if not journal or not journal.path.exists():
+                self.note("No durable journal for the current job.", title="JOURNAL", collapsed=False)
+            else:
+                try:
+                    ok, reason = journal.verify()
+                    rows = journal.read() if ok else []
+                    tail = rows[-20:]
+                    self.note(
+                        f"integrity: {'PASS' if ok else 'FAIL'} · {reason}\n"
+                        + "\n".join(
+                            f"{row.get('seq')} · {row.get('event')} · {row.get('timestamp')}"
+                            for row in tail
+                        ),
+                        title="JOURNAL",
+                        collapsed=False,
+                    )
+                except Exception as exc:
+                    self.note(str(exc), title="JOURNAL", collapsed=False)
+
+        elif cmd == "/runtime":
+            if not self.job or not self.job_dir:
+                self.note("No active durable runtime.", title="RUNTIME", collapsed=False)
+            else:
+                binding_ok, binding_reason = self._job_binding_ok()
+                journal = self._journal()
+                journal_ok, journal_reason = (journal.verify() if journal and journal.path.exists() else (False, "missing"))
+                unresolved = []
+                if journal and journal_ok:
+                    unresolved = journal.unresolved_intents()
+                workflow = self._workflow_store()
+                workflow_data = {}
+                if workflow and workflow.path.exists():
+                    try:
+                        workflow_data = json.loads(workflow.path.read_text())
+                    except Exception:
+                        workflow_data = {}
+                self.note(
+                    "binding: " + ("PASS" if binding_ok else "FAIL") + f" · {binding_reason}\n"
+                    "journal: " + ("PASS" if journal_ok else "FAIL") + f" · {journal_reason}\n"
+                    f"unresolved_side_effects: {len(unresolved)}\n"
+                    f"checkout_lease: {'held' if self.job.get('checkout_lease_token') else 'released'}\n"
+                    f"workflow_owner: {workflow_data.get('owner') or '-'}",
+                    title="RUNTIME",
+                    collapsed=False,
+                )
 
         elif cmd == "/session":
             if self.job and self.job_dir:
