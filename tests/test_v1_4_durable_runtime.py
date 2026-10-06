@@ -381,3 +381,62 @@ def test_compact_router_fixture_hides_subscription_breakdown() -> None:
     assert "subscription" not in legacy.lower()
     assert "cap=" not in legacy
     assert "(1.99)" in legacy
+
+
+def test_checkout_release_requires_matching_token(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "token-repo")
+    manager = MainCheckoutLeaseManager(tmp_path / "leases")
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "job.json").write_text(json.dumps({"status": "READY"}))
+    token = manager.acquire(repo=repo, job_id="job", job_dir=job)
+    assert manager.release(repo=repo, token=None) is False
+    assert manager.owns(repo=repo, token=token)
+    assert manager.release(repo=repo, token="wrong-token") is False
+    assert manager.owns(repo=repo, token=token)
+    assert manager.release(repo=repo, token=token) is True
+
+
+def test_journal_malformed_tail_is_integrity_failure(tmp_path: Path) -> None:
+    journal = EventJournal(tmp_path / "malformed.jsonl")
+    journal.append("one")
+    with journal.path.open("a") as handle:
+        handle.write('{"seq":')
+    ok, reason = journal.verify()
+    assert not ok
+    assert "parse" in reason or "invalid journal" in reason
+
+
+def test_worker_parser_accepts_durable_lease_flags() -> None:
+    worker = (APP / "ai_job_worker.py").read_text()
+    for flag in ("--lease-file", "--job-id", "--run-number", "--prompt-sha"):
+        assert flag in worker
+    assert "refresh_main_lease" in worker
+    assert "write_main_lease" in worker
+
+
+def test_checkout_lease_does_not_expire_live_launcher_by_age(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "live-launcher")
+    manager = MainCheckoutLeaseManager(tmp_path / "leases")
+    job_a = tmp_path / "job-a"
+    job_b = tmp_path / "job-b"
+    job_a.mkdir()
+    job_b.mkdir()
+    (job_a / "job.json").write_text(json.dumps({"status": "PREPARING"}))
+    (job_b / "job.json").write_text(json.dumps({"status": "READY"}))
+    token = manager.acquire(repo=repo, job_id="job-a", job_dir=job_a)
+    lease_path = manager.path_for_repo(repo)
+    lease = json.loads(lease_path.read_text())
+    lease["created_at_epoch"] = 0
+    lease_path.write_text(json.dumps(lease))
+    with pytest.raises(RuntimeError, match="CHECKOUT_LEASE_BUSY"):
+        manager.acquire(repo=repo, job_id="job-b", job_dir=job_b)
+    assert manager.release(repo=repo, token=token)
+
+
+def test_worktree_registration_failure_has_explicit_rollback_path() -> None:
+    p1 = (APP / "phase1_supervisor.py").read_text()
+    prepare = p1[p1.index("def _prepare_worktree("):p1.index("def _worktree_registry_id(")]
+    assert "def rollback_created(" in prepare
+    assert "rollback_created(None)" in prepare
+    assert "rollback_created(branch)" in prepare
