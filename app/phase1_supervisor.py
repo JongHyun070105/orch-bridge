@@ -57,13 +57,13 @@ TARGETS = {
     },
     "sonnet": {
         "backend": "agy",
-        "model": "claude-sonnet-4-6-thinking",
-        "label": "Claude Sonnet 4.6 Thinking",
+        "model": "claude-sonnet-5-5",
+        "label": "Claude Sonnet 5.5",
     },
     "opus": {
         "backend": "agy",
-        "model": "claude-opus-4-6-thinking",
-        "label": "Claude Opus 4.6 Thinking",
+        "model": "claude-opus-5-5",
+        "label": "Claude Opus 5.5",
     },
     "gemini-low": {
         "backend": "agy",
@@ -1372,18 +1372,19 @@ def _run_agy(
     timeout: int,
     env: dict[str, str],
 ) -> tuple[int, str, str, str]:
-    argv = [
-        "agy",
-        "-p",
-        prompt,
-        "--model",
-        model,
+    argv = ["agy", "-p", prompt, "--model", model]
+    if model.startswith("claude-"):
+        effort = str(env.get("AI_ORCH_AGY_CLAUDE_EFFORT", "medium")).strip().lower()
+        if effort not in {"low", "medium", "high"}:
+            effort = "medium"
+        argv.extend(["--effort", effort])
+    argv.extend([
         "--output-format",
         "stream-json",
         "--dangerously-skip-permissions",
         "--print-timeout",
         f"{max(1, timeout // 60)}m",
-    ]
+    ])
     p = _run(argv, cwd=cwd, timeout=timeout, env=env)
     final = ""
     for line in p.stdout.splitlines():
