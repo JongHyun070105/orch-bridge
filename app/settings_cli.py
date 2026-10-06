@@ -21,8 +21,8 @@ DEFAULT_MODELS = {
     "gemini_high": "gemini-3.8-flash-high",
     "claude_sonnet": "claude-sonnet-5-5",
     "claude_opus": "claude-opus-5-5",
-    "sonnet": "claude-sonnet-4-6-thinking",
-    "opus": "claude-opus-4-6-thinking",
+    "sonnet": "claude-sonnet-5-5",
+    "opus": "claude-opus-5-5",
 }
 PROVIDER_BINARIES = {
     "codex": "codex",
