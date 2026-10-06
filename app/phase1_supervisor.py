@@ -1048,7 +1048,7 @@ def _recover_stale_running(
         # Only disposable read-only worktrees are auto-cleaned.
         if str(mode) == "read_only" and worktree is not None:
             try:
-                _remove_worktree(repo, worktree)
+                _safe_remove_worktree(repo, worktree)
             except Exception:
                 pass
 
@@ -1152,7 +1152,7 @@ def _cleanup_stale_worktrees(
 
         if not dry_run:
             _set_tree_read_only(path, False)
-            _remove_worktree(repo, path)
+            _safe_remove_worktree(repo, path)
 
     if not dry_run:
         _run(["git", "worktree", "prune"], cwd=repo, timeout=30)
@@ -1225,14 +1225,102 @@ def _prepare_worktree(
     return path, branch, False
 
 
-def _remove_worktree(repo: Path, path: Path) -> None:
-    _set_tree_read_only(path, False)
-    _run(
-        ["git", "worktree", "remove", "--force", str(path)],
-        cwd=repo,
-        timeout=60,
+def _worktree_registry_id(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(WORKTREES_DIR.resolve()).as_posix()
+    except Exception:
+        return ""
+
+
+def _safe_remove_worktree(repo: Path, path: Path) -> str:
+    """Delete only a worktree whose ownership and disposable state are proven."""
+    path = path.resolve()
+    worktree_id = _worktree_registry_id(path)
+    record = WORKTREE_OWNERSHIP.get(worktree_id) if worktree_id else None
+    ownership_proven = bool(record)
+
+    if record:
+        try:
+            ownership_proven = ownership_proven and (
+                Path(str(record.get("path") or "")).expanduser().resolve() == path
+            )
+            ownership_proven = ownership_proven and (
+                Path(str(record.get("repo_id") or "")).expanduser().resolve()
+                == _repo_root(repo)
+            )
+            ownership_proven = ownership_proven and (_repo_root(path) == path)
+        except Exception:
+            ownership_proven = False
+
+    dirty = True
+    unique_commits = 1
+    if ownership_proven and record:
+        try:
+            dirty = bool(_git(path, "status", "--porcelain=v1", "--untracked-files=all"))
+            base_commit = str(record.get("base_commit") or "")
+            if base_commit:
+                unique_raw = _git(path, "rev-list", "--count", f"{base_commit}..HEAD")
+                unique_commits = int(unique_raw or "0")
+            else:
+                unique_commits = 1
+        except Exception:
+            ownership_proven = False
+            dirty = True
+            unique_commits = 1
+
+    decision = WORKTREE_OWNERSHIP.cleanup_decision(
+        ownership_proven=ownership_proven,
+        dirty=dirty,
+        unique_commits=unique_commits,
+        remote_confirmed=False,
     )
-    _run(["git", "worktree", "prune"], cwd=repo, timeout=30)
+    if record:
+        try:
+            WORKTREE_OWNERSHIP.mark_cleanup(
+                worktree_id,
+                decision,
+                dirty=dirty,
+                unique_commits=unique_commits,
+                ownership_proven=ownership_proven,
+            )
+        except Exception:
+            pass
+
+    if decision != "DELETE_ELIGIBLE":
+        print(
+            f"[delegate] preserve worktree {path}: cleanup={decision} "
+            f"ownership={ownership_proven} dirty={dirty} unique={unique_commits}",
+            file=sys.stderr,
+        )
+        return decision
+
+    try:
+        _set_tree_read_only(path, False)
+        p = _run(
+            ["git", "worktree", "remove", "--force", str(path)],
+            cwd=repo,
+            timeout=60,
+        )
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr.strip() or "git worktree remove failed")
+        _run(["git", "worktree", "prune"], cwd=repo, timeout=30)
+    except Exception as exc:
+        if record:
+            try:
+                WORKTREE_OWNERSHIP.mark_cleanup(
+                    worktree_id,
+                    "CLEANUP_FAILED",
+                    error=repr(exc),
+                )
+            except Exception:
+                pass
+        raise
+    if record:
+        try:
+            WORKTREE_OWNERSHIP.mark_cleanup(worktree_id, "CLEANED")
+        except Exception:
+            pass
+    return "CLEANED"
 
 
 def _governance_text(repo: Path) -> str:
@@ -2395,7 +2483,7 @@ def delegate(args: argparse.Namespace) -> int:
 
         if worktree is not None and ephemeral:
             try:
-                _remove_worktree(repo, worktree)
+                _safe_remove_worktree(repo, worktree)
             except Exception as e:
                 print(f"[delegate] warning: failed to remove temp worktree: {e}", file=sys.stderr)
 
