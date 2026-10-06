@@ -318,6 +318,7 @@ SLASH_COMMANDS = [
     ("/copy all", "User / Assistant 대화 내용만 복사"),
     ("/copy worked", "마지막 답변 + WORKED 요약 복사"),
     ("/copy prompt", "현재 작업의 정확한 프롬프트 복사"),
+    ("/ui compact|verbose", "기본 TUI 정보 밀도 설정"),
     ("/compact", "재개용 압축 체크포인트 작성"),
 
     ("/jobs", "영구 작업 목록 보기"),
@@ -4522,6 +4523,17 @@ RESUME RULES:
                 self.note(f"Detail · {self.verbosity}", title="DISPLAY")
             else:
                 self.note("usage: /verbose normal|verbose|trace", title="HELP")
+
+        elif cmd == "/ui":
+            mode = p[1].lower() if len(p) >= 2 else self.ui_density
+            if mode not in {"compact", "verbose"}:
+                self.note("usage: /ui compact|verbose", title="HELP", collapsed=False)
+            else:
+                self.ui_density = mode
+                self._save_tui_state()
+                self.update_banner()
+                self.update_agentdock()
+                self.note(f"UI density · {mode}", title="DISPLAY")
 
         elif cmd in {"/details", "/detail"}:
             self.action_details()
