@@ -397,6 +397,8 @@ class MainCheckoutLeaseManager:
             data = load_json(path, {})
             if not isinstance(data, dict) or str(data.get("token") or "") != str(token):
                 raise RuntimeError("CHECKOUT_LEASE_LOST")
+            if bool(data.get("quarantined")):
+                raise RuntimeError("CHECKOUT_QUARANTINED")
             data["worker_pid"] = int(worker_pid)
             data["updated_at"] = iso()
             atomic_json(path, data)
