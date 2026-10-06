@@ -191,8 +191,8 @@ class RepoIdentity:
             except Exception:
                 return False, "repo root could not be normalized"
         expected_remote = normalize_remote(str(binding.get("remote_origin") or ""))
-        if expected_remote and self.remote_origin and expected_remote != self.remote_origin:
-            return False, f"remote mismatch: {self.remote_origin} != {expected_remote}"
+        if expected_remote and expected_remote != self.remote_origin:
+            return False, f"remote mismatch: {self.remote_origin or '<missing>'} != {expected_remote}"
         return True, "ok"
 
 
@@ -286,9 +286,8 @@ class MainCheckoutLeaseManager:
         return self.root / f"{key}.json"
 
     def _active(self, data: dict[str, Any]) -> bool:
-        # A durable job status is not proof that a writer process still exists.
-        # Ownership is live only while the worker is alive, or during the short
-        # pre-spawn handoff while the launcher that created the lease is alive.
+        if bool(data.get("quarantined")):
+            return True
         worker_pid = int(data.get("worker_pid") or 0)
         if pid_alive(worker_pid):
             return True
@@ -297,7 +296,20 @@ class MainCheckoutLeaseManager:
             age = max(0.0, now() - float(data.get("created_at_epoch") or 0))
         except Exception:
             age = 999.0
-        return pid_alive(launcher_pid) and age < 30.0
+        if pid_alive(launcher_pid) and age < 30.0:
+            return True
+
+        # PREPARING/READY/RUNNING are retained until startup recovery
+        # reconciles them. This closes the crash window between durable state,
+        # branch side effects, and worker PID publication.
+        job_dir = Path(str(data.get("job_dir") or ""))
+        if job_dir:
+            job = load_json(job_dir / "job.json", {})
+            if isinstance(job, dict):
+                status = str(job.get("status") or "").upper()
+                if status in {"PREPARING", "READY", "RUNNING"}:
+                    return True
+        return False
 
     def acquire(self, *, repo: Path, job_id: str, job_dir: Path) -> str:
         path = self.path_for_repo(repo)
@@ -341,6 +353,44 @@ class MainCheckoutLeaseManager:
         data = load_json(self.path_for_repo(repo), {})
         return isinstance(data, dict) and str(data.get("token") or "") == str(token)
 
+    def adopt(self, *, repo: Path, token: str) -> None:
+        path = self.path_for_repo(repo)
+        with file_lock(path.with_suffix(".lock")):
+            data = load_json(path, {})
+            if not isinstance(data, dict) or str(data.get("token") or "") != str(token):
+                raise RuntimeError("CHECKOUT_LEASE_LOST")
+            if bool(data.get("quarantined")):
+                raise RuntimeError("CHECKOUT_QUARANTINED")
+            data["launcher_pid"] = os.getpid()
+            data["created_at_epoch"] = now()
+            data["updated_at"] = iso()
+            atomic_json(path, data)
+
+    def quarantine(self, *, repo: Path, token: str, reason: str) -> None:
+        path = self.path_for_repo(repo)
+        with file_lock(path.with_suffix(".lock")):
+            data = load_json(path, {})
+            if not isinstance(data, dict) or str(data.get("token") or "") != str(token):
+                raise RuntimeError("CHECKOUT_LEASE_LOST")
+            data["quarantined"] = True
+            data["quarantine_reason"] = str(reason)
+            data["worker_pid"] = 0
+            data["updated_at"] = iso()
+            atomic_json(path, data)
+
+    def clear_quarantine(self, *, repo: Path, token: str) -> None:
+        path = self.path_for_repo(repo)
+        with file_lock(path.with_suffix(".lock")):
+            data = load_json(path, {})
+            if not isinstance(data, dict) or str(data.get("token") or "") != str(token):
+                raise RuntimeError("CHECKOUT_LEASE_LOST")
+            data["quarantined"] = False
+            data["quarantine_reason"] = None
+            data["launcher_pid"] = os.getpid()
+            data["created_at_epoch"] = now()
+            data["updated_at"] = iso()
+            atomic_json(path, data)
+
     def refresh_worker(self, *, repo: Path, token: str, worker_pid: int) -> None:
         path = self.path_for_repo(repo)
         with file_lock(path.with_suffix(".lock")):
@@ -351,13 +401,15 @@ class MainCheckoutLeaseManager:
             data["updated_at"] = iso()
             atomic_json(path, data)
 
-    def release(self, *, repo: Path, token: str | None) -> bool:
+    def release(self, *, repo: Path, token: str | None, allow_quarantine: bool = False) -> bool:
         path = self.path_for_repo(repo)
         if not path.exists():
             return True
         with file_lock(path.with_suffix(".lock")):
             data = load_json(path, {})
             if token and isinstance(data, dict) and str(data.get("token") or "") != str(token):
+                return False
+            if isinstance(data, dict) and bool(data.get("quarantined")) and not allow_quarantine:
                 return False
             try:
                 path.unlink()
@@ -366,11 +418,26 @@ class MainCheckoutLeaseManager:
         return True
 
 
-def find_live_prompt_collision(jobs_dir: Path, prompt_sha256: str) -> dict[str, Any] | None:
+def find_live_prompt_collision(
+    jobs_dir: Path,
+    prompt_sha256: str,
+    *,
+    repo: Path | None = None,
+) -> dict[str, Any] | None:
+    expected_repo = str(canonical_repo(repo)) if repo is not None else ""
     for job_dir in sorted(Path(jobs_dir).glob("job-*"), reverse=True):
         job = load_json(job_dir / "job.json", {})
         if not isinstance(job, dict) or str(job.get("prompt_sha256") or "") != str(prompt_sha256):
             continue
+        if expected_repo:
+            binding = job.get("project_binding") if isinstance(job.get("project_binding"), dict) else {}
+            recorded_repo = str(binding.get("repo_root") or job.get("repo") or "")
+            try:
+                recorded_repo = str(Path(recorded_repo).expanduser().resolve()) if recorded_repo else ""
+            except Exception:
+                recorded_repo = ""
+            if recorded_repo != expected_repo:
+                continue
         status = str(job.get("status") or "").upper()
         if status in {"COMPLETE", "FAILED", "CANCELLED", "BLOCKED", "NEEDS_USER", "NEEDS_GO"}:
             continue
@@ -434,6 +501,8 @@ class EventJournal:
                 prev_hash = stored
                 expected_seq += 1
             anchor = load_json(self.anchor_path, {})
+            if not rows and isinstance(anchor, dict) and anchor:
+                return False, "journal chain missing while tail anchor exists"
             if rows:
                 if not isinstance(anchor, dict) or not anchor:
                     return False, "tail anchor missing"
@@ -473,6 +542,8 @@ class EventJournal:
                 expected_seq += 1
 
             anchor = load_json(self.anchor_path, {})
+            if not rows and isinstance(anchor, dict) and anchor:
+                raise RuntimeError("journal chain missing while tail anchor exists")
             if rows:
                 if not isinstance(anchor, dict) or not anchor:
                     raise RuntimeError("journal tail anchor missing before append")
@@ -618,6 +689,25 @@ class WorktreeOwnershipRegistry:
             atomic_json(self.path, data)
             return merged
 
+    def get(self, worktree_id: str) -> dict[str, Any] | None:
+        with file_lock(self.lock_path, exclusive=False):
+            data = load_json(self.path, {"worktrees": {}})
+            item = (data.get("worktrees") or {}).get(str(worktree_id)) if isinstance(data, dict) else None
+            return dict(item) if isinstance(item, dict) else None
+
+    def mark_cleanup(self, worktree_id: str, state: str, **fields: Any) -> None:
+        with file_lock(self.lock_path):
+            data = load_json(self.path, {"schema": WORKTREE_SCHEMA, "worktrees": {}})
+            worktrees = data.setdefault("worktrees", {})
+            item = worktrees.get(str(worktree_id))
+            if not isinstance(item, dict):
+                raise RuntimeError("WORKTREE_OWNERSHIP_MISSING")
+            item = dict(item)
+            item.update({"cleanup_state": str(state), "updated_at": iso(), **redact(fields)})
+            worktrees[str(worktree_id)] = item
+            data["updated_at"] = iso()
+            atomic_json(self.path, data)
+
     @staticmethod
     def cleanup_decision(
         *, ownership_proven: bool, dirty: bool, unique_commits: int, remote_confirmed: bool
@@ -710,7 +800,9 @@ def verify_completion(
         str(binding.get("prompt_sha256") or "") == prompt_sha
     )
 
-    ok_journal, journal_reason = journal.verify()
+    journal_present = journal.path.is_file() and journal.anchor_path.is_file()
+    checks["journal_present"] = journal_present
+    ok_journal, journal_reason = journal.verify() if journal_present else (False, "journal or tail anchor missing")
     checks["journal_integrity"] = ok_journal
     if not ok_journal:
         errors.append("journal: " + journal_reason)
