@@ -12,7 +12,9 @@ Local multi-provider coding-agent orchestrator with adaptive routing, safe deleg
 
 OrchBridge runs multiple AI coding CLIs behind one TUI and one routing layer. It can choose a MAIN agent, delegate independent checks, preserve project-scoped state, queue follow-up work, manage safe Git branches, show quota/health information, and notify you when long-running work finishes.
 
-> **Current release v1.3.1** — quality-first routing, scheduled prompts, proactive collaboration, Claude Code 5.5, and quota-aware fallback.\n>\n> **Next v1.4** adds immutable project/prompt binding, an atomic MAIN checkout lease, a tamper-evident event journal, crash reconciliation, an independent completion verification gate, durable goal/todo/workflow state, worktree ownership, AGY Claude 5.5 with effort, and a compact default TUI.
+> **Current release v1.3.1** — quality-first routing, scheduled prompts, proactive collaboration, Claude Code 5.5, and quota-aware fallback.
+>
+> **Next v1.4** adds immutable project/prompt binding, an atomic MAIN checkout lease, a tamper-evident event journal, crash reconciliation, an independent completion verification gate, durable goal/todo/workflow state, worktree ownership, AGY Claude 5.5 with effort, and a compact default TUI.
 
 ## Quick start
 
@@ -54,7 +56,14 @@ Most coding-agent CLIs are excellent on their own, but real work often needs mor
 - **Persistent scheduled prompts** that enter the project FIFO queue when due without interrupting an active job
 - **Global provider health fallback** so exhausted Command Code credit is excluded from MAIN/judge/delegate routing until a bounded recovery probe succeeds
 - **Role-aware proactive collaboration** that favors independent reviewers/researchers and does not spend useful delegate budget on provider-level blocked calls
-- **Immutable project/prompt binding + atomic MAIN checkout lease** to reject cross-project dispatch and concurrent writers before model execution\n- **Append-only durable event journal** with a hash chain + tail anchor and fail-closed crash reconciliation\n- **Independent completion verification gate** that checks repo/prompt/journal evidence before accepting COMPLETE\n- **Durable goal / todo / workflow state** outside the model conversation\n- **Delegate worktree ownership registry** that refuses to delete unproven occupied paths\n- **AGY Claude Sonnet/Opus 5.5 + low/medium/high effort**\n- **Compact default TUI** with final router scores and concise quota state; `/ui verbose` restores detail\n- **Claude Code 5.5 defaults + adaptive effort** with visible progress/tool activity but no hidden chain-of-thought exposure
+- **Immutable project/prompt binding + atomic MAIN checkout lease** to reject cross-project dispatch and concurrent writers before model execution
+- **Append-only durable event journal** with a hash chain + tail anchor and fail-closed crash reconciliation
+- **Independent completion verification gate** that checks repo/prompt/journal evidence before accepting COMPLETE
+- **Durable goal / todo / workflow state** outside the model conversation
+- **Delegate worktree ownership registry** that refuses to delete unproven occupied paths
+- **AGY Claude Sonnet/Opus 5.5 + low/medium/high effort**
+- **Compact default TUI** with final router scores and concise quota state; `/ui verbose` restores detail
+- **Claude Code 5.5 defaults + adaptive effort** with visible progress/tool activity but no hidden chain-of-thought exposure
 - **Visible ranked router utility** with compact final scores and exclusion reasons
 - **Project slot pin/auto controls** plus live-window compaction and transcript auto-follow
 - **Textual TUI** with a working `Ctrl+P` command palette
