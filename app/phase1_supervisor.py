@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from orch_kernel import WorktreeOwnershipRegistry
 from provider_health_state import (
     clear_provider as clear_global_provider,
     mark_quota_exhausted as mark_global_quota_exhausted,
@@ -41,6 +42,7 @@ EVENTS_PATH = DELEGATIONS_DIR / "events.jsonl"
 QUOTA_LEDGER_PATH = DELEGATIONS_DIR / "quota-ledger.jsonl"
 GLOBAL_FACT_LEDGER = DELEGATIONS_DIR / "fact-ledger.jsonl"
 PROVIDER_HEALTH_PATH = BASE / "delegations/provider-health.json"
+WORKTREE_OWNERSHIP = WorktreeOwnershipRegistry(PROJECT_BASE / "delegations")
 
 DEFAULT_TIMEOUT = int(os.environ.get("AI_ORCH_DELEGATE_TIMEOUT", "1200"))
 DEDUP_TTL = int(os.environ.get("AI_ORCH_DEDUP_TTL", "1800"))
@@ -1173,7 +1175,9 @@ def _prepare_worktree(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if path.exists():
-        shutil.rmtree(path, ignore_errors=True)
+        raise RuntimeError(
+            f"WORKTREE_PATH_OCCUPIED: refusing to delete unproven existing path: {path}"
+        )
 
     if mode == "read_only":
         p = _run(
@@ -1184,6 +1188,18 @@ def _prepare_worktree(
         if p.returncode != 0:
             raise RuntimeError(f"read-only worktree add failed: {p.stderr.strip()}")
         _set_tree_read_only(path, True)
+        WORKTREE_OWNERSHIP.register({
+            "worktree_id": f"{job_seg}/{worker_seg}",
+            "owner_job_id": parent_job_id,
+            "owner_agent_id": worker_id,
+            "repo_id": str(_repo_root(repo)),
+            "base_commit": head,
+            "branch": None,
+            "path": str(path),
+            "mode": "read_only",
+            "lifecycle": "LEASE_ACTIVE",
+            "cleanup_state": "ACTIVE",
+        })
         return path, None, True
 
     branch = f"orch/{job_seg}/{worker_seg}"
@@ -1194,6 +1210,18 @@ def _prepare_worktree(
     )
     if p.returncode != 0:
         raise RuntimeError(f"write worktree add failed: {p.stderr.strip()}")
+    WORKTREE_OWNERSHIP.register({
+        "worktree_id": f"{job_seg}/{worker_seg}",
+        "owner_job_id": parent_job_id,
+        "owner_agent_id": worker_id,
+        "repo_id": str(_repo_root(repo)),
+        "base_commit": head,
+        "branch": branch,
+        "path": str(path),
+        "mode": "write",
+        "lifecycle": "LEASE_ACTIVE",
+        "cleanup_state": "PRESERVE_UNTIL_PROVEN",
+    })
     return path, branch, False
 
 
