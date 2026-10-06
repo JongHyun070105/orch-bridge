@@ -325,6 +325,12 @@ class MainCheckoutLeaseManager:
                     pass
         raise RuntimeError("CHECKOUT_LEASE_BUSY: could not acquire checkout lease")
 
+    def owns(self, *, repo: Path, token: str | None) -> bool:
+        if not token:
+            return False
+        data = load_json(self.path_for_repo(repo), {})
+        return isinstance(data, dict) and str(data.get("token") or "") == str(token)
+
     def refresh_worker(self, *, repo: Path, token: str, worker_pid: int) -> None:
         path = self.path_for_repo(repo)
         with file_lock(path.with_suffix(".lock")):
