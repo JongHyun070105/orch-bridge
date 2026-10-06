@@ -3529,6 +3529,19 @@ RESUME RULES:
             )
             return
 
+        binding_ok, binding_reason = self._job_binding_ok()
+        if not binding_ok:
+            self.job.update({
+                "status": "BLOCKED",
+                "task_status": "BLOCKED",
+                "binding_error": binding_reason,
+            })
+            self._release_checkout_lease()
+            self.save()
+            self.note(binding_reason, title="PROJECT BINDING GUARD", collapsed=False)
+            self.update_banner()
+            return
+
         foreign_same_repo = self._foreign_live_same_repo_worker()
         if foreign_same_repo:
             self.note(
@@ -3539,6 +3552,20 @@ RESUME RULES:
                 collapsed=False,
             )
             return
+
+        if not self.job.get("checkout_lease_token"):
+            try:
+                self.job["checkout_lease_token"] = CHECKOUT_LEASE_MANAGER.acquire(
+                    repo=self.repo,
+                    job_id=str(self.job.get("id") or self.job_dir.name),
+                    job_dir=self.job_dir,
+                )
+                self.save()
+            except Exception as exc:
+                self.job.update({"status": "BLOCKED", "task_status": "BLOCKED"})
+                self.save()
+                self.note(str(exc), title="REPO OWNERSHIP GUARD", collapsed=False)
+                return
 
         task, raw_user = self.task_text(resume)
         n = int(self.job.get("attempt", 0)) + 1
@@ -3577,11 +3604,25 @@ RESUME RULES:
         worker_env["AI_ORCH_DELEGATION_DEPTH"] = "0"
         worker_env["AI_ORCH_PROMPT_SHA256"] = str(self.job.get("prompt_sha256", ""))
         worker_env["AI_ORCH_MAX_DELEGATES_PER_JOB"] = str(self.job.get("max_delegates", 3))
-        worker_env["AI_ORCH_PERMISSION_PROFILE"] = str(self.job.get("permission_profile", self.permission_profile))
+        worker_env["AI_ORCH_PERMISSION_PROFILE"] = str(
+            self.job.get("permission_profile", self.permission_profile)
+        )
         if str(self.job.get("scope_mode", self.scope_mode)) == "strict":
             worker_env["AI_ORCH_STRICT_TASK"] = "1"
         else:
             worker_env.pop("AI_ORCH_STRICT_TASK", None)
+
+        journal = self._journal()
+        workflow = self._workflow_store()
+        if journal:
+            journal.append(
+                "main.worker_launch",
+                job_id=str(self.job.get("id") or ""),
+                run_number=n,
+                resume=bool(resume),
+            )
+        if workflow:
+            workflow.transition("main", "STARTING", run_number=n)
 
         self._last_main_output_at = now()
         self._last_proc_diag_at = 0.0
@@ -3589,16 +3630,30 @@ RESUME RULES:
         self._stall_notice_level = 0
         self._recovered_main_result_posted = False
 
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-            env=worker_env,
-        )
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+                env=worker_env,
+            )
+        except Exception:
+            self.job.update({"status": "PAUSED_RETRY", "resume_at": now() + 60})
+            self._release_checkout_lease()
+            self.save()
+            raise
+
         self.proc = proc
+        token = str(self.job.get("checkout_lease_token") or "")
+        if token:
+            CHECKOUT_LEASE_MANAGER.refresh_worker(
+                repo=self.repo,
+                token=token,
+                worker_pid=proc.pid,
+            )
         pgid = process_pgid(proc.pid) or proc.pid
         self.job["worker"] = {
             "pid": proc.pid,
@@ -3610,6 +3665,8 @@ RESUME RULES:
             "started_at": iso(),
         }
         self.save()
+        if workflow:
+            workflow.transition("main", "RUNNING", run_number=n, pid=proc.pid)
 
         self.raw.clear()
         scope = self.job.get("scope_mode", self.scope_mode)
@@ -4533,16 +4590,24 @@ RESUME RULES:
             self._queue_tick()
             return
 
+        branch_plan = self._branch_next_plan()
         try:
-            self._branch_apply_plan(self._branch_next_plan())
+            self.new_job(
+                prompt,
+                attachments=attachments,
+                branch_plan=branch_plan,
+            )
         except Exception as e:
-            self.note(f"브랜치 준비 실패: {e}\n프롬프트는 입력창에 그대로 유지했습니다.", title="BRANCH ERROR", collapsed=False)
+            self.note(
+                f"작업 시작 실패: {e}\n프롬프트는 입력창에 그대로 유지했습니다.",
+                title="RUNTIME FAILURE",
+                collapsed=False,
+            )
             return
         self._branch_consume_pending()
         box.load_text("")
         self.pending_attachments.clear()
         self.update_commandbar()
-        self.new_job(prompt, attachments=attachments)
         self._remember_submit(prompt, attachments)
 
     def command(self, text: str) -> None:
