@@ -121,8 +121,16 @@ def _run_git(repo: Path, *args: str, timeout: int = 8) -> str:
 
 
 def canonical_repo(path: Path) -> Path:
-    root = _run_git(Path(path).expanduser().resolve(), "rev-parse", "--show-toplevel")
-    return Path(root).expanduser().resolve()
+    """Return canonical Git root, or the resolved workspace for non-Git projects."""
+    resolved = Path(path).expanduser().resolve()
+    probe = resolved.parent if resolved.is_file() else resolved
+    try:
+        root = _run_git(probe, "rev-parse", "--show-toplevel")
+        if root:
+            return Path(root).expanduser().resolve()
+    except Exception:
+        pass
+    return resolved
 
 
 def normalize_remote(raw: str) -> str:
@@ -160,10 +168,18 @@ class RepoIdentity:
             remote = normalize_remote(_run_git(root, "remote", "get-url", "origin"))
         except Exception:
             remote = ""
-        head = _run_git(root, "rev-parse", "HEAD")
-        branch = _run_git(root, "branch", "--show-current") or "detached"
-        status = _run_git(root, "status", "--porcelain=v1", "--untracked-files=all")
-        dirty = len([line for line in status.splitlines() if line.strip()])
+        try:
+            head = _run_git(root, "rev-parse", "HEAD")
+            branch = _run_git(root, "branch", "--show-current") or "detached"
+            status = _run_git(root, "status", "--porcelain=v1", "--untracked-files=all")
+            dirty = len([line for line in status.splitlines() if line.strip()])
+        except Exception:
+            # OrchBridge supports registered --no-git workspaces. Their canonical
+            # resolved path remains a valid project identity, but Git-specific
+            # identity fields are intentionally empty.
+            head = ""
+            branch = "non-git"
+            dirty = 0
         return cls(str(root), remote, head, branch, dirty)
 
     def matches_binding(self, binding: dict[str, Any]) -> tuple[bool, str]:
@@ -270,15 +286,9 @@ class MainCheckoutLeaseManager:
         return self.root / f"{key}.json"
 
     def _active(self, data: dict[str, Any]) -> bool:
-        job_dir = Path(str(data.get("job_dir") or ""))
-        if job_dir:
-            job = load_json(job_dir / "job.json", {})
-            if isinstance(job, dict):
-                status = str(job.get("status") or "").upper()
-                if status and status not in {
-                    "COMPLETE", "FAILED", "CANCELLED", "BLOCKED", "NEEDS_USER", "NEEDS_GO"
-                }:
-                    return True
+        # A durable job status is not proof that a writer process still exists.
+        # Ownership is live only while the worker is alive, or during the short
+        # pre-spawn handoff while the launcher that created the lease is alive.
         worker_pid = int(data.get("worker_pid") or 0)
         if pid_alive(worker_pid):
             return True
@@ -424,7 +434,9 @@ class EventJournal:
                 prev_hash = stored
                 expected_seq += 1
             anchor = load_json(self.anchor_path, {})
-            if rows and isinstance(anchor, dict) and anchor:
+            if rows:
+                if not isinstance(anchor, dict) or not anchor:
+                    return False, "tail anchor missing"
                 last = rows[-1]
                 if int(anchor.get("seq") or 0) != int(last.get("seq") or 0):
                     return False, "tail anchor sequence mismatch"
@@ -461,7 +473,9 @@ class EventJournal:
                 expected_seq += 1
 
             anchor = load_json(self.anchor_path, {})
-            if rows and isinstance(anchor, dict) and anchor:
+            if rows:
+                if not isinstance(anchor, dict) or not anchor:
+                    raise RuntimeError("journal tail anchor missing before append")
                 last = rows[-1]
                 if int(anchor.get("seq") or 0) != int(last.get("seq") or 0) or str(anchor.get("hash") or "") != str(last.get("hash") or ""):
                     raise RuntimeError("journal tail anchor mismatch before append")
@@ -688,6 +702,13 @@ def verify_completion(
     except Exception:
         prompt_sha = ""
     checks["prompt_hash"] = bool(prompt_sha) and prompt_sha == str(job.get("prompt_sha256") or "")
+    binding = job.get("project_binding") if isinstance(job.get("project_binding"), dict) else {}
+    checks["binding_digest"] = bool(binding) and (
+        binding_digest(binding) == str(job.get("binding_sha256") or "")
+    )
+    checks["binding_prompt"] = bool(binding) and (
+        str(binding.get("prompt_sha256") or "") == prompt_sha
+    )
 
     ok_journal, journal_reason = journal.verify()
     checks["journal_integrity"] = ok_journal
