@@ -5692,7 +5692,7 @@ RESUME RULES:
             decision, route = self._latest_router_lines()
             text_out = (
                 f"decision: {decision or 'not available'}\n"
-                f"route:\n{pretty_router_panel(route, compact=self.ui_density != "verbose") if route else 'not available'}\n"
+                f"route:\n{pretty_router_panel(route, compact=self.ui_density != 'verbose') if route else 'not available'}\n"
                 f"CMD global: {self._global_cmd_health_summary()}"
             )
             self.note(text_out, title="DECISION", collapsed=False)
