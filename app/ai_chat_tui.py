@@ -3746,11 +3746,38 @@ RESUME RULES:
         self.proc = proc
         token = str(self.job.get("checkout_lease_token") or "")
         if token:
-            CHECKOUT_LEASE_MANAGER.refresh_worker(
-                repo=self.repo,
-                token=token,
-                worker_pid=proc.pid,
-            )
+            try:
+                CHECKOUT_LEASE_MANAGER.refresh_worker(
+                    repo=self.repo,
+                    token=token,
+                    worker_pid=proc.pid,
+                )
+            except Exception as exc:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+                self.proc = None
+                self.job.update({
+                    "status": "BLOCKED",
+                    "task_status": "BLOCKED",
+                    "runtime_error": f"CHECKOUT_LEASE_LOST: {exc}",
+                })
+                self._release_checkout_lease()
+                self.save()
+                self.note(
+                    self.job["runtime_error"],
+                    title="REPO OWNERSHIP GUARD",
+                    collapsed=False,
+                )
+                return
         pgid = process_pgid(proc.pid) or proc.pid
         self.job["worker"] = {
             "pid": proc.pid,
@@ -4004,8 +4031,6 @@ RESUME RULES:
         # still held. Release only after those checks, never before.
         if durable_enabled:
             self._release_checkout_lease()
-        if self.job is not None:
-            self.save()
         self._recovered_main_result_posted = False
 
         if response:
