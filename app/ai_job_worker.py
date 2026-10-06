@@ -7,11 +7,10 @@ import json
 import os
 import sys
 import threading
-import time
 import traceback
 from pathlib import Path
 
-from orch_runtime import make_main_lease, process_pgid, refresh_main_lease, write_main_lease
+from orch_runtime import finish_main_heartbeat, process_pgid, start_main_heartbeat
 
 
 def load_module(path: Path):
@@ -55,10 +54,10 @@ def main() -> int:
     out = Path(ns.result_file).expanduser().resolve()
     lease_path = Path(ns.lease_file).expanduser().resolve() if ns.lease_file else None
 
-    stop = threading.Event()
+    stop: threading.Event | None = None
     hb: threading.Thread | None = None
     if lease_path:
-        write_main_lease(
+        stop, hb = start_main_heartbeat(
             lease_path,
             job_id=ns.job_id,
             repo=str(repo),
@@ -67,22 +66,7 @@ def main() -> int:
             run_number=ns.run_number,
             prompt_sha256=ns.prompt_sha,
             result_file=str(out),
-            state="RUNNING",
         )
-
-        def heartbeat() -> None:
-            while not stop.wait(10):
-                try:
-                    refresh_main_lease(lease_path, state="RUNNING")
-                except Exception:
-                    pass
-
-        hb = threading.Thread(
-            target=heartbeat,
-            name=f"main-lease-{ns.job_id}",
-            daemon=True,
-        )
-        hb.start()
 
     rc = 1
     try:
@@ -116,26 +100,20 @@ def main() -> int:
         )
         return rc
     finally:
-        stop.set()
-        if hb and hb.is_alive():
-            hb.join(timeout=1)
         if lease_path:
-            try:
-                data = make_main_lease(
-                    job_id=ns.job_id,
-                    repo=str(repo),
-                    pid=os.getpid(),
-                    pgid=process_pgid(os.getpid()) or os.getpid(),
-                    run_number=ns.run_number,
-                    prompt_sha256=ns.prompt_sha,
-                    result_file=str(out),
-                    state="EXITED",
-                )
-                data["exit_code"] = int(rc)
-                data["ended_at_epoch"] = time.time()
-                _atomic_json(lease_path, data)
-            except Exception:
-                pass
+            finish_main_heartbeat(
+                lease_path,
+                stop,
+                hb,
+                job_id=ns.job_id,
+                repo=str(repo),
+                pid=os.getpid(),
+                pgid=process_pgid(os.getpid()) or os.getpid(),
+                run_number=ns.run_number,
+                prompt_sha256=ns.prompt_sha,
+                result_file=str(out),
+                exit_code=int(rc),
+            )
 
 
 if __name__ == "__main__":
