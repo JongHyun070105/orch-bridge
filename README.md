@@ -12,13 +12,13 @@ Local multi-provider coding-agent orchestrator with adaptive routing, safe deleg
 
 OrchBridge runs multiple AI coding CLIs behind one TUI and one routing layer. It can choose a MAIN agent, delegate independent checks, preserve project-scoped state, queue follow-up work, manage safe Git branches, show quota/health information, and notify you when long-running work finishes.
 
-> **v1.3.0** — quality-first routing, persistent scheduled prompts, proactive cross-provider collaboration, Claude Code 5.5 with adaptive effort, global quota-aware fallback, router visibility, transcript auto-follow, and project slot pin/compaction.
+> **Current release v1.3.1** — quality-first routing, scheduled prompts, proactive collaboration, Claude Code 5.5, and quota-aware fallback.\n>\n> **Next v1.4** adds immutable project/prompt binding, an atomic MAIN checkout lease, a tamper-evident event journal, crash reconciliation, an independent completion verification gate, durable goal/todo/workflow state, worktree ownership, AGY Claude 5.5 with effort, and a compact default TUI.
 
 ## Quick start
 
 ```bash
-curl -fLO https://github.com/JongHyun070105/orch-bridge/releases/download/v1.3.0/orchbridge-v1.3.0.sh
-bash orchbridge-v1.3.0.sh
+curl -fLO https://github.com/JongHyun070105/orch-bridge/releases/download/v1.3.1/orchbridge-v1.3.1.sh
+bash orchbridge-v1.3.1.sh
 orch doctor
 orch settings detect
 cd ~/Projects/my-project
@@ -54,7 +54,7 @@ Most coding-agent CLIs are excellent on their own, but real work often needs mor
 - **Persistent scheduled prompts** that enter the project FIFO queue when due without interrupting an active job
 - **Global provider health fallback** so exhausted Command Code credit is excluded from MAIN/judge/delegate routing until a bounded recovery probe succeeds
 - **Role-aware proactive collaboration** that favors independent reviewers/researchers and does not spend useful delegate budget on provider-level blocked calls
-- **Claude Code 5.5 defaults + adaptive effort** with visible progress/tool activity but no hidden chain-of-thought exposure
+- **Immutable project/prompt binding + atomic MAIN checkout lease** to reject cross-project dispatch and concurrent writers before model execution\n- **Append-only durable event journal** with a hash chain + tail anchor and fail-closed crash reconciliation\n- **Independent completion verification gate** that checks repo/prompt/journal evidence before accepting COMPLETE\n- **Durable goal / todo / workflow state** outside the model conversation\n- **Delegate worktree ownership registry** that refuses to delete unproven occupied paths\n- **AGY Claude Sonnet/Opus 5.5 + low/medium/high effort**\n- **Compact default TUI** with final router scores and concise quota state; `/ui verbose` restores detail\n- **Claude Code 5.5 defaults + adaptive effort** with visible progress/tool activity but no hidden chain-of-thought exposure
 - **Visible ranked router utility** with compact final scores and exclusion reasons
 - **Project slot pin/auto controls** plus live-window compaction and transcript auto-follow
 - **Textual TUI** with a working `Ctrl+P` command palette
@@ -95,7 +95,7 @@ Closing a live unpinned project compacts the remaining live project numbers whil
 | macOS | Supported | `terminal-notifier` or built-in `osascript` | `pbcopy` |
 | Linux | Supported | `notify-send` | `wl-copy`, `xclip`, or `xsel` |
 
-Windows is not supported in v1.3. WSL2 may work as a Linux environment but is not part of the v1.3 support contract.
+Windows is not currently supported. WSL2 may work as a Linux environment but is not part of the support contract.
 
 ## Requirements
 
@@ -120,16 +120,16 @@ OrchBridge does **not** install or store credentials for these providers. Each p
 
 ### Release asset
 
-Download `orchbridge-v1.3.0.sh` from the [v1.3.0 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.3.0), or fetch it directly:
+Download `orchbridge-v1.3.1.sh` from the [v1.3.1 GitHub Release](https://github.com/JongHyun070105/orch-bridge/releases/tag/v1.3.1), or fetch it directly:
 
 ```bash
-bash orchbridge-v1.3.0.sh
+bash orchbridge-v1.3.1.sh
 ```
 
 If Git/tmux/Python support is missing and you want the installer to use Homebrew, apt, dnf, or pacman:
 
 ```bash
-bash orchbridge-v1.3.0.sh --install-system-deps
+bash orchbridge-v1.3.1.sh --install-system-deps
 ```
 
 ### Development checkout
@@ -383,7 +383,7 @@ The YAML files are examples/specifications, not executable workflow plans in v1.
 
 ## Limitations
 
-- Windows is not officially supported in v1.3.0.
+- Windows is not officially supported in v1.3.1.
 - Provider capabilities and authentication depend on upstream CLIs, subscriptions, and local setup.
 - Quota information is best-effort and can be unavailable or stale.
 - Workflow YAML files are reference examples; a declarative workflow execution engine is not included.
