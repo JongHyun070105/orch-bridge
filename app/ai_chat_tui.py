@@ -328,6 +328,7 @@ SLASH_COMMANDS = [
     ("/todo add <text>", "현재 작업 durable todo 추가"),
     ("/journal", "현재 작업 event journal 상태 보기"),
     ("/runtime", "binding / journal / workflow runtime 상태 보기"),
+    ("/reconcile <intent-id> <success|not-run|failed>", "미확정 side effect를 사용자 확인으로 종결"),
     ("/pause", "현재 작업 일시정지"),
     ("/resume", "일시정지된 작업 재개"),
     ("/retry", "현재 일시정지 작업 재시도 / 재개"),
@@ -2034,14 +2035,44 @@ class OrchBridgeApp(App):
             "schema": 1,
         }
 
-    def _release_checkout_lease(self) -> None:
+    def _release_checkout_lease(self) -> bool:
         if not self.job:
-            return
+            return True
+        token = str(self.job.get("checkout_lease_token") or "") or None
+        released = CHECKOUT_LEASE_MANAGER.release(repo=self.repo, token=token)
+        if released:
+            self.job["checkout_lease_token"] = None
+        return released
+
+    def _quarantine_checkout(self, reason: str) -> bool:
+        if not self.job or not self.job_dir:
+            return False
         token = str(self.job.get("checkout_lease_token") or "") or None
         try:
-            CHECKOUT_LEASE_MANAGER.release(repo=self.repo, token=token)
-        finally:
-            self.job["checkout_lease_token"] = None
+            if not token or not CHECKOUT_LEASE_MANAGER.owns(repo=self.repo, token=token):
+                token = CHECKOUT_LEASE_MANAGER.acquire(
+                    repo=self.repo,
+                    job_id=str(self.job.get("id") or self.job_dir.name),
+                    job_dir=self.job_dir,
+                )
+                self.job["checkout_lease_token"] = token
+            CHECKOUT_LEASE_MANAGER.quarantine(
+                repo=self.repo,
+                token=token,
+                reason=reason,
+            )
+            self.job["checkout_quarantine"] = {
+                "reason": reason,
+                "since": iso(),
+            }
+            return True
+        except Exception as exc:
+            self.job["checkout_quarantine"] = {
+                "reason": reason,
+                "error": repr(exc),
+                "since": iso(),
+            }
+            return False
 
     def _queue_enqueue(
         self,
@@ -3163,6 +3194,8 @@ class OrchBridgeApp(App):
                 continue
 
             if j.get("status") not in {
+                "PREPARING",
+                "READY",
                 "RUNNING",
                 "PAUSED_QUOTA",
                 "PAUSED_RETRY",
@@ -3235,34 +3268,128 @@ class OrchBridgeApp(App):
                 break
 
             journal = self._journal()
-            if journal and journal.path.exists():
-                ok, reason = journal.verify()
-                if not ok:
-                    j["status"] = "BLOCKED"
-                    j["task_status"] = "BLOCKED"
-                    j["runtime_error"] = "V14_JOURNAL_INTEGRITY_FAILURE: " + reason
-                    self._release_checkout_lease()
-                    self.save()
-                    self.note(j["runtime_error"], title="RUNTIME INTEGRITY", collapsed=False)
-                    break
-                unresolved = journal.unresolved_intents()
-                if unresolved:
+            assert journal is not None
+
+            # A crash can happen after PREPARING is durable but before the first
+            # journal record. That specific window is safe to reconstruct only if
+            # Git state is still exactly the recorded start state.
+            if not journal.path.exists() or not journal.anchor_path.exists():
+                safe_preparing_bootstrap = (
+                    str(j.get("status") or "") == "PREPARING"
+                    and git_branch(self.repo) == str(j.get("branch_at_start") or "")
+                    and git_head(self.repo) == str(j.get("head_at_start") or "")
+                    and not journal.path.exists()
+                    and not journal.anchor_path.exists()
+                )
+                if safe_preparing_bootstrap:
+                    self._initialize_durable_runtime(recovered_prompt)
+                    journal = self._journal()
+                    assert journal is not None
+                    journal.append(
+                        "runtime.preparing_bootstrap_recovered",
+                        job_id=str(j.get("id") or d.name),
+                    )
+                else:
+                    reason = "V14_JOURNAL_INTEGRITY_FAILURE: durable journal or tail anchor missing"
                     j["status"] = "NEEDS_USER"
                     j["task_status"] = "NEEDS_USER"
-                    j["runtime_error"] = (
-                        f"V14_UNRESOLVED_SIDE_EFFECT: {len(unresolved)} intent(s) require reconciliation"
-                    )
-                    self._release_checkout_lease()
+                    j["runtime_error"] = reason
+                    self._quarantine_checkout(reason)
                     self.save()
-                    self.note(
-                        j["runtime_error"],
-                        title="RUNTIME RECOVERY",
-                        collapsed=False,
-                    )
+                    self.note(reason, title="RUNTIME INTEGRITY", collapsed=False)
                     break
+
+            ok, reason = journal.verify()
+            if not ok:
+                runtime_error = "V14_JOURNAL_INTEGRITY_FAILURE: " + reason
+                j["status"] = "NEEDS_USER"
+                j["task_status"] = "NEEDS_USER"
+                j["runtime_error"] = runtime_error
+                self._quarantine_checkout(runtime_error)
+                self.save()
+                self.note(runtime_error, title="RUNTIME INTEGRITY", collapsed=False)
+                break
+
+            unresolved = journal.unresolved_intents()
+            if unresolved:
+                runtime_error = (
+                    f"V14_UNRESOLVED_SIDE_EFFECT: {len(unresolved)} intent(s) require reconciliation"
+                )
+                j["status"] = "NEEDS_USER"
+                j["task_status"] = "NEEDS_USER"
+                j["runtime_error"] = runtime_error
+                self._quarantine_checkout(runtime_error)
+                self.save()
+                intents = "\n".join(
+                    f"- {row.get('intent_id')} · {row.get('operation')}"
+                    for row in unresolved[:12]
+                )
+                self.note(
+                    runtime_error
+                    + "\nCheckout remains quarantined. Confirm actual external state, then use:\n"
+                    + "/reconcile <intent-id> success|not-run|failed\n"
+                    + intents,
+                    title="RUNTIME RECOVERY",
+                    collapsed=False,
+                )
+                break
+
+            token = str(j.get("checkout_lease_token") or "") or None
+            if token and CHECKOUT_LEASE_MANAGER.owns(repo=self.repo, token=token):
+                try:
+                    CHECKOUT_LEASE_MANAGER.adopt(repo=self.repo, token=token)
+                except Exception:
+                    pass
 
             changed = False
             recovery_detail = ""
+
+            if j["status"] == "PREPARING":
+                # No unresolved intent means branch mutation either never started
+                # or reached a terminal record. If it never started, replay it now
+                # under the same checkout ownership.
+                rows = journal.read()
+                branch_intents = [
+                    row for row in rows
+                    if row.get("event") == "side_effect.intent"
+                    and row.get("operation") == "git.branch_plan"
+                ]
+                if not branch_intents:
+                    plan = j.get("branch_plan") if isinstance(j.get("branch_plan"), dict) else None
+                    branch_intent = journal.intent(
+                        "git.branch_plan",
+                        idempotency_key=f"{j.get('id')}:branch-plan-recovery",
+                        plan=plan,
+                    )
+                    try:
+                        self._branch_apply_plan(plan)
+                    except Exception as exc:
+                        journal.terminal(str(branch_intent["intent_id"]), "failed", error=repr(exc))
+                        j["status"] = "BLOCKED"
+                        j["task_status"] = "BLOCKED"
+                        j["runtime_error"] = f"branch recovery failed: {exc}"
+                        self._release_checkout_lease()
+                        self.save()
+                        self.note(j["runtime_error"], title="BRANCH ERROR", collapsed=False)
+                        break
+                    else:
+                        journal.terminal(
+                            str(branch_intent["intent_id"]),
+                            "success",
+                            branch=git_branch(self.repo),
+                            head=git_head(self.repo),
+                        )
+                j["branch_at_start"] = git_branch(self.repo)
+                j["head_at_start"] = git_head(self.repo)
+                j["status"] = "READY"
+                changed = True
+
+            if j["status"] == "READY":
+                j["status"] = "PAUSED_RETRY"
+                j["resume_at"] = now() + 15
+                self._recovery_grace_until = float(j["resume_at"])
+                recovery_detail = "\nRecovered pre-launch READY state; retry grace 15s."
+                changed = True
 
             if j["status"] == "RUNNING":
                 runtime = self._runtime_for_job(j, d, adopt_legacy=True)
@@ -3293,15 +3420,14 @@ class OrchBridgeApp(App):
             if recovered_prompt:
                 self._mount_user_message(recovered_prompt)
 
-            if journal:
-                try:
-                    journal.append(
-                        "runtime.recovered",
-                        job_id=str(j.get("id") or d.name),
-                        status=str(j.get("status") or ""),
-                    )
-                except Exception:
-                    pass
+            try:
+                journal.append(
+                    "runtime.recovered",
+                    job_id=str(j.get("id") or d.name),
+                    status=str(j.get("status") or ""),
+                )
+            except Exception:
+                pass
 
             msg = f"Recovered {j['id']} · {j['status']} · {j.get('title','task')}" + recovery_detail
             if self._recovery_grace_until and j["status"] != "RUNNING":
@@ -3311,6 +3437,7 @@ class OrchBridgeApp(App):
                 )
             self.note(msg, title="SESSION", collapsed=False)
             break
+
 
     def save(self) -> None:
         if self.job_dir and self.job:
@@ -3492,7 +3619,7 @@ RESUME RULES:
             if not ok or binding_digest(expected_binding) != binding_sha:
                 raise RuntimeError(reason or "PROJECT_BINDING_MISMATCH: queued binding differs from current project")
 
-        collision = find_live_prompt_collision(JOBS_DIR, prompt_sha)
+        collision = find_live_prompt_collision(JOBS_DIR, prompt_sha, repo=self.repo)
         if collision:
             raise RuntimeError(
                 "DUPLICATE_MAIN_PROMPT: identical prompt is already running "
@@ -3551,6 +3678,7 @@ RESUME RULES:
                 "attachments": attachments,
                 "skills": skills,
                 "queue_entry_id": queue_entry_id,
+                "branch_plan": branch_plan,
                 "project_binding": binding,
                 "binding_sha256": binding_sha,
                 "checkout_lease_token": lease_token,
@@ -3866,7 +3994,7 @@ RESUME RULES:
                 if cmd_health != "HEALTHY":
                     extra.append(f"CMD excluded: {cmd_health}")
             self.note(
-                f"source: {source}\n{pretty_router_panel(self.route)}"
+                f"source: {source}\n{pretty_router_panel(self.route, compact=self.ui_density != "verbose")}"
                 + (("\n" + "\n".join(extra)) if extra else ""),
                 title="ROUTER",
                 collapsed=False,
@@ -5165,6 +5293,88 @@ RESUME RULES:
                     collapsed=False,
                 )
 
+        elif cmd == "/reconcile":
+            if not self.job or not self.job_dir:
+                self.note("No active job.", title="RECONCILE", collapsed=False)
+            elif len(p) < 3 or p[2].lower() not in {"success", "not-run", "failed"}:
+                self.note(
+                    "usage: /reconcile <intent-id> <success|not-run|failed>",
+                    title="HELP",
+                    collapsed=False,
+                )
+            else:
+                intent_id = p[1]
+                outcome = p[2].lower()
+                journal = self._journal()
+                assert journal is not None
+                try:
+                    unresolved = {
+                        str(row.get("intent_id") or ""): row
+                        for row in journal.unresolved_intents()
+                    }
+                except Exception as exc:
+                    self.note(str(exc), title="RECONCILE", collapsed=False)
+                    return
+                if intent_id not in unresolved:
+                    self.note(
+                        f"Intent {intent_id} is not currently unresolved.",
+                        title="RECONCILE",
+                        collapsed=False,
+                    )
+                else:
+                    journal.terminal(
+                        intent_id,
+                        outcome,
+                        reconciled_by="user",
+                        reconciled_at=iso(),
+                    )
+                    remaining = journal.unresolved_intents()
+                    if remaining:
+                        self.note(
+                            f"Reconciled {intent_id}; {len(remaining)} unresolved intent(s) remain.",
+                            title="RECONCILE",
+                            collapsed=False,
+                        )
+                    else:
+                        token = str(self.job.get("checkout_lease_token") or "")
+                        if token:
+                            try:
+                                CHECKOUT_LEASE_MANAGER.clear_quarantine(
+                                    repo=self.repo,
+                                    token=token,
+                                )
+                                CHECKOUT_LEASE_MANAGER.release(
+                                    repo=self.repo,
+                                    token=token,
+                                    allow_quarantine=True,
+                                )
+                                self.job["checkout_lease_token"] = None
+                            except Exception as exc:
+                                self.note(
+                                    f"Side effect is reconciled, but checkout quarantine could not be cleared: {exc}",
+                                    title="RECONCILE",
+                                    collapsed=False,
+                                )
+                                return
+                        self.job["checkout_quarantine"] = None
+                        self.job["runtime_error"] = None
+                        self.job["status"] = "PAUSED_USER"
+                        self.job["task_status"] = None
+                        self.job["resume_at"] = None
+                        journal.append(
+                            "runtime.user_reconciled",
+                            job_id=str(self.job.get("id") or ""),
+                            intent_id=intent_id,
+                            outcome=outcome,
+                        )
+                        self.save()
+                        self.update_banner()
+                        self.note(
+                            f"Reconciled {intent_id} as {outcome}. Checkout quarantine cleared. Use /resume to continue.",
+                            title="RECONCILE",
+                            collapsed=False,
+                        )
+
         elif cmd == "/session":
             if self.job and self.job_dir:
                 text_out = (
@@ -5482,7 +5692,7 @@ RESUME RULES:
             decision, route = self._latest_router_lines()
             text_out = (
                 f"decision: {decision or 'not available'}\n"
-                f"route:\n{pretty_router_panel(route) if route else 'not available'}\n"
+                f"route:\n{pretty_router_panel(route, compact=self.ui_density != "verbose") if route else 'not available'}\n"
                 f"CMD global: {self._global_cmd_health_summary()}"
             )
             self.note(text_out, title="DECISION", collapsed=False)
