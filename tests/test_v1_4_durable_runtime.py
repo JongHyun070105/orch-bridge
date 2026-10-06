@@ -137,6 +137,35 @@ def test_immutable_project_binding_rejects_cross_repo_context(tmp_path: Path) ->
     assert "PROJECT_BINDING_MISMATCH" in reason
 
 
+def test_non_git_registered_workspace_has_stable_binding(tmp_path: Path) -> None:
+    repo = tmp_path / "plain-workspace"
+    repo.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    prompt_sha = hashlib.sha256(b"plain task").hexdigest()
+
+    binding = build_project_binding(
+        repo=repo,
+        workspace_id="plain-ws",
+        project_base=state,
+        project_name="plain",
+        prompt_sha256=prompt_sha,
+    )
+    digest = binding_digest(binding)
+    assert binding["repo_root"] == str(repo.resolve())
+    assert binding["remote_origin"] == ""
+
+    ok, reason = validate_project_binding(
+        binding=binding,
+        digest=digest,
+        repo=repo,
+        workspace_id="plain-ws",
+        project_base=state,
+        prompt_sha256=prompt_sha,
+    )
+    assert ok, reason
+
+
 def test_atomic_checkout_lease_blocks_second_main_before_worker(tmp_path: Path) -> None:
     repo = _repo(tmp_path, "repo")
     manager = MainCheckoutLeaseManager(tmp_path / "leases")
@@ -152,6 +181,30 @@ def test_atomic_checkout_lease_blocks_second_main_before_worker(tmp_path: Path) 
         manager.acquire(repo=repo, job_id="job-b", job_dir=job_b)
     assert manager.owns(repo=repo, token=token)
     assert manager.release(repo=repo, token=token)
+
+
+def test_stale_pre_spawn_checkout_lease_is_reclaimable(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "stale-repo")
+    manager = MainCheckoutLeaseManager(tmp_path / "leases")
+    job_a = tmp_path / "job-a"
+    job_b = tmp_path / "job-b"
+    job_a.mkdir()
+    job_b.mkdir()
+    (job_a / "job.json").write_text(json.dumps({"status": "READY"}))
+    (job_b / "job.json").write_text(json.dumps({"status": "READY"}))
+
+    token = manager.acquire(repo=repo, job_id="job-a", job_dir=job_a)
+    lease_path = manager.path_for_repo(repo)
+    lease = json.loads(lease_path.read_text())
+    lease["launcher_pid"] = 99999999
+    lease["worker_pid"] = 0
+    lease["created_at_epoch"] = 0
+    lease_path.write_text(json.dumps(lease))
+
+    replacement = manager.acquire(repo=repo, job_id="job-b", job_dir=job_b)
+    assert replacement != token
+    assert manager.owns(repo=repo, token=replacement)
+    assert manager.release(repo=repo, token=replacement)
 
 
 def test_event_journal_detects_mutation_and_clean_tail_truncation(tmp_path: Path) -> None:
