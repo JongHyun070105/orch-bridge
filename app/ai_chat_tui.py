@@ -547,7 +547,7 @@ def pretty_route(route: str) -> str:
     }
     out = route
     for key, label in mapping.items():
-        out = re.sub(rf"\b{re.escape(key)}(?=\()", label + " ", out)
+        out = re.sub(rf"\b{re.escape(key)}(?=\(|$)", label + " ", out)
     return out
 
 
@@ -940,13 +940,6 @@ class OrchBridgeApp(App):
         background: #0f1318;
         color: #7aa2f7;
         border-top: solid #202832;
-    }
-
-    #composer-label {
-        height: 1;
-        padding: 0 2;
-        background: #0b0d10;
-        color: #6f7f90;
     }
 
     #prompt {
