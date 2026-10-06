@@ -1930,6 +1930,110 @@ class OrchBridgeApp(App):
                 return i
         return None
 
+    def _current_project_binding(self, prompt_sha: str) -> dict[str, Any]:
+        return build_project_binding(
+            repo=self.repo,
+            workspace_id=WORKSPACE_ID or os.getenv("AI_ORCH_WORKSPACE_ID"),
+            project_base=PROJECT_BASE,
+            project_name=PROJECT_NAME or os.getenv("AI_ORCH_PROJECT_NAME") or self.repo.name,
+            prompt_sha256=prompt_sha,
+        )
+
+    def _validate_binding(
+        self,
+        binding: dict[str, Any],
+        digest: str | None,
+        prompt_sha: str,
+    ) -> tuple[bool, str]:
+        return validate_project_binding(
+            binding=binding,
+            digest=digest,
+            repo=self.repo,
+            workspace_id=WORKSPACE_ID or os.getenv("AI_ORCH_WORKSPACE_ID"),
+            project_base=PROJECT_BASE,
+            prompt_sha256=prompt_sha,
+        )
+
+    def _queue_entry_binding_ok(self, entry: dict[str, Any]) -> tuple[bool, str]:
+        prompt = str(entry.get("prompt") or "")
+        prompt_sha = self._prompt_sha(prompt)
+        if str(entry.get("prompt_sha256") or "") != prompt_sha:
+            return False, "PROJECT_BINDING_MISMATCH: queue prompt hash changed"
+        binding = entry.get("project_binding")
+        if not isinstance(binding, dict):
+            return False, "PROJECT_BINDING_MISMATCH: queue entry has no immutable binding"
+        return self._validate_binding(
+            binding,
+            str(entry.get("binding_sha256") or "") or None,
+            prompt_sha,
+        )
+
+    def _job_binding_ok(self) -> tuple[bool, str]:
+        if not self.job or not self.job_dir:
+            return False, "PROJECT_BINDING_MISMATCH: no active job"
+        try:
+            prompt = (self.job_dir / "original-prompt.md").read_text()
+        except Exception as exc:
+            return False, f"PROJECT_BINDING_MISMATCH: original prompt unavailable: {exc}"
+        prompt_sha = self._prompt_sha(prompt)
+        if str(self.job.get("prompt_sha256") or "") != prompt_sha:
+            return False, "PROJECT_BINDING_MISMATCH: persisted prompt hash differs"
+        binding = self.job.get("project_binding")
+        if not isinstance(binding, dict):
+            return False, "PROJECT_BINDING_MISMATCH: job has no immutable binding"
+        return self._validate_binding(
+            binding,
+            str(self.job.get("binding_sha256") or "") or None,
+            prompt_sha,
+        )
+
+    def _journal(self) -> EventJournal | None:
+        return EventJournal(self.job_dir / "journal-v14.jsonl") if self.job_dir else None
+
+    def _goal_store(self) -> GoalStore | None:
+        return GoalStore(self.job_dir) if self.job_dir else None
+
+    def _workflow_store(self) -> WorkflowStore | None:
+        return WorkflowStore(self.job_dir) if self.job_dir else None
+
+    def _initialize_durable_runtime(self, prompt: str) -> None:
+        if not self.job or not self.job_dir:
+            return
+        journal = self._journal()
+        assert journal is not None
+        if not journal.path.exists() or not journal.read():
+            journal.append(
+                "job.created",
+                job_id=str(self.job.get("id") or self.job_dir.name),
+                repo=str(self.repo),
+                project_binding=self.job.get("project_binding") or {},
+                binding_sha256=self.job.get("binding_sha256"),
+                prompt_sha256=self.job.get("prompt_sha256"),
+            )
+        goal = GoalStore(self.job_dir)
+        goal.initialize(prompt.strip())
+        workflow = WorkflowStore(self.job_dir)
+        workflow.initialize(capacity=max(1, int(self.job.get("max_delegates") or 3) + 1))
+        workflow.set_owner(str(self.job.get("id") or self.job_dir.name))
+        workflow.transition("main", "QUEUED")
+        workflow.transition("verify", "WAITING")
+        self.job["runtime_v14"] = {
+            "journal": "journal-v14.jsonl",
+            "goal": "goal.json",
+            "todo": "todo.json",
+            "workflow": "workflow.json",
+            "schema": 1,
+        }
+
+    def _release_checkout_lease(self) -> None:
+        if not self.job:
+            return
+        token = str(self.job.get("checkout_lease_token") or "") or None
+        try:
+            CHECKOUT_LEASE_MANAGER.release(repo=self.repo, token=token)
+        finally:
+            self.job["checkout_lease_token"] = None
+
     def _queue_enqueue(
         self,
         prompt: str,
