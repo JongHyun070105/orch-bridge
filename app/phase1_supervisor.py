@@ -1179,6 +1179,33 @@ def _prepare_worktree(
             f"WORKTREE_PATH_OCCUPIED: refusing to delete unproven existing path: {path}"
         )
 
+    worktree_id = f"{job_seg}/{worker_seg}"
+
+    def rollback_created(branch: str | None) -> None:
+        # This checkout/branch was created by this call and no worker has been
+        # launched yet, so rollback is mechanically owned and bounded.
+        try:
+            _set_tree_read_only(path, False)
+        except Exception:
+            pass
+        try:
+            _run(
+                ["git", "worktree", "remove", "--force", str(path)],
+                cwd=repo,
+                timeout=60,
+            )
+        except Exception:
+            pass
+        if branch:
+            try:
+                _run(["git", "branch", "-D", branch], cwd=repo, timeout=30)
+            except Exception:
+                pass
+        try:
+            _run(["git", "worktree", "prune"], cwd=repo, timeout=30)
+        except Exception:
+            pass
+
     if mode == "read_only":
         p = _run(
             ["git", "worktree", "add", "--detach", str(path), head],
@@ -1188,18 +1215,22 @@ def _prepare_worktree(
         if p.returncode != 0:
             raise RuntimeError(f"read-only worktree add failed: {p.stderr.strip()}")
         _set_tree_read_only(path, True)
-        WORKTREE_OWNERSHIP.register({
-            "worktree_id": f"{job_seg}/{worker_seg}",
-            "owner_job_id": parent_job_id,
-            "owner_agent_id": worker_id,
-            "repo_id": str(_repo_root(repo)),
-            "base_commit": head,
-            "branch": None,
-            "path": str(path),
-            "mode": "read_only",
-            "lifecycle": "LEASE_ACTIVE",
-            "cleanup_state": "ACTIVE",
-        })
+        try:
+            WORKTREE_OWNERSHIP.register({
+                "worktree_id": worktree_id,
+                "owner_job_id": parent_job_id,
+                "owner_agent_id": worker_id,
+                "repo_id": str(_repo_root(repo)),
+                "base_commit": head,
+                "branch": None,
+                "path": str(path),
+                "mode": "read_only",
+                "lifecycle": "LEASE_ACTIVE",
+                "cleanup_state": "ACTIVE",
+            })
+        except Exception:
+            rollback_created(None)
+            raise
         return path, None, True
 
     branch = f"orch/{job_seg}/{worker_seg}"
@@ -1210,20 +1241,23 @@ def _prepare_worktree(
     )
     if p.returncode != 0:
         raise RuntimeError(f"write worktree add failed: {p.stderr.strip()}")
-    WORKTREE_OWNERSHIP.register({
-        "worktree_id": f"{job_seg}/{worker_seg}",
-        "owner_job_id": parent_job_id,
-        "owner_agent_id": worker_id,
-        "repo_id": str(_repo_root(repo)),
-        "base_commit": head,
-        "branch": branch,
-        "path": str(path),
-        "mode": "write",
-        "lifecycle": "LEASE_ACTIVE",
-        "cleanup_state": "PRESERVE_UNTIL_PROVEN",
-    })
+    try:
+        WORKTREE_OWNERSHIP.register({
+            "worktree_id": worktree_id,
+            "owner_job_id": parent_job_id,
+            "owner_agent_id": worker_id,
+            "repo_id": str(_repo_root(repo)),
+            "base_commit": head,
+            "branch": branch,
+            "path": str(path),
+            "mode": "write",
+            "lifecycle": "LEASE_ACTIVE",
+            "cleanup_state": "PRESERVE_UNTIL_PROVEN",
+        })
+    except Exception:
+        rollback_created(branch)
+        raise
     return path, branch, False
-
 
 def _worktree_registry_id(path: Path) -> str:
     try:
