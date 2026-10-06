@@ -2062,6 +2062,8 @@ class OrchBridgeApp(App):
             result = dict(duplicate)
             result["_duplicate_suppressed"] = True
             return result
+
+        binding = self._current_project_binding(prompt_sha)
         entry_id = (
             "queue-" + datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-")
             + hashlib.sha256((prompt + str(now())).encode("utf-8")).hexdigest()[:8]
@@ -2074,6 +2076,8 @@ class OrchBridgeApp(App):
             "attachments": list(dict.fromkeys(str(x) for x in attachments if str(x))),
             "runtime": self._current_runtime_state(),
             "branch_plan": self._branch_next_plan(),
+            "project_binding": binding,
+            "binding_sha256": binding_digest(binding),
         }
         self.queue_state.setdefault("items", []).append(entry)
         if gate and not self.queue_state.get("gate") and not self.queue_state.get("active_entry_id"):
@@ -2147,18 +2151,25 @@ class OrchBridgeApp(App):
             self._queue_halt("QUEUE_ENTRY_INVALID: id가 없는 대기 작업을 발견했습니다.")
             return
 
-        # Persist the claim before creating the job. A restart can repair this
-        # claim from job.queue_entry_id, or release it if no job was created.
+        binding_ok, binding_reason = self._queue_entry_binding_ok(entry)
+        if not binding_ok:
+            self._queue_halt(binding_reason)
+            return
+
+        # Persist the claim before creating the job. The queue item remains durable
+        # if launch fails, but project binding is revalidated before any mutation.
         self.queue_state["active_entry_id"] = entry_id
         self._save_queue_state()
         try:
-            self._branch_apply_plan(entry.get("branch_plan") if isinstance(entry.get("branch_plan"), dict) else None)
             self._queue_apply_runtime(entry)
             attachments = [str(x) for x in entry.get("attachments", []) if str(x)]
             self.new_job(
                 str(entry.get("prompt") or ""),
                 attachments=attachments,
                 queue_entry_id=entry_id,
+                expected_binding=entry.get("project_binding"),
+                expected_binding_sha=str(entry.get("binding_sha256") or "") or None,
+                branch_plan=entry.get("branch_plan") if isinstance(entry.get("branch_plan"), dict) else None,
             )
             self.queue_state["gate"] = self._queue_gate_for_current_job()
             self.queue_state["halted_reason"] = None
@@ -2169,8 +2180,6 @@ class OrchBridgeApp(App):
                 collapsed=False,
             )
         except Exception as e:
-            # Keep the queue item. If a job was created, recovery will repair
-            # the active claim; otherwise release it for an explicit retry.
             if not (self.job and str(self.job.get("queue_entry_id") or "") == entry_id):
                 self.queue_state["active_entry_id"] = None
             self.queue_state["halted_reason"] = (
@@ -3363,59 +3372,145 @@ RESUME RULES:
         *,
         attachments: list[str] | None = None,
         queue_entry_id: str | None = None,
+        expected_binding: dict[str, Any] | None = None,
+        expected_binding_sha: str | None = None,
+        branch_plan: dict[str, Any] | None = None,
     ) -> None:
         stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
         d = JOBS_DIR / f"job-{stamp}"
-        d.mkdir(parents=True)
-        (d / "original-prompt.md").write_text(prompt)
-        (d / "checkpoint.md").write_text("")
+        if d.exists():
+            suffix = hashlib.sha256(f"{time.time_ns()}:{os.getpid()}".encode()).hexdigest()[:6]
+            d = JOBS_DIR / f"job-{stamp}-{suffix}"
 
         scope_mode, max_delegates = self._parse_job_directives(prompt)
         prompt_sha = self._prompt_sha(prompt)
-        attachments = list(self.pending_attachments) if attachments is None else list(attachments)
-        try:
-            pskill = subprocess.run(
-                [str(HOME / ".local/bin/orch-skills"), "select", "--text", prompt, "--limit", "2", "--json"],
-                capture_output=True, text=True, timeout=10,
-                env={**os.environ.copy(), "AI_ORCH_PROJECT_BASE": str(PROJECT_BASE), "AI_ORCH_REPO": str(self.repo)},
-            )
-            skills = json.loads(pskill.stdout) if pskill.returncode == 0 else []
-        except Exception:
-            skills = []
+        binding = self._current_project_binding(prompt_sha)
+        binding_sha = binding_digest(binding)
 
-        self.job_dir = d
-        self.job = {
-            "schema_version": 2,
-            "id": d.name,
-            "title": (prompt.splitlines()[0] if prompt else "task")[:100],
-            "repo": str(self.repo),
-            "workspace_id": os.getenv("AI_ORCH_WORKSPACE_ID"),
-            "project_base": str(PROJECT_BASE),
-            "branch_at_start": git_branch(self.repo),
-            "head_at_start": git_head(self.repo),
-            "created_at": iso(),
-            "updated_at": iso(),
-            "status": "READY",
-            "resume_at": None,
-            "attempt": 0,
-            "task_status": None,
-            "scope_mode": scope_mode,
-            "permission_profile": self.permission_profile,
-            "max_delegates": max_delegates,
-            "prompt_sha256": prompt_sha,
-            "prompt_preview": prompt[:240],
-            "attachments": attachments,
-            "skills": skills,
-            "queue_entry_id": queue_entry_id,
-        }
-        self.save()
-        self.raw.clear()
-        self.attempts.clear()
-        self.current = None
-        self.delegate_states.clear()
-        self._mount_user_message(prompt)
-        self.start(False)
-        self.pending_attachments.clear()
+        if expected_binding is not None:
+            ok, reason = self._validate_binding(
+                expected_binding,
+                expected_binding_sha,
+                prompt_sha,
+            )
+            if not ok or binding_digest(expected_binding) != binding_sha:
+                raise RuntimeError(reason or "PROJECT_BINDING_MISMATCH: queued binding differs from current project")
+
+        collision = find_live_prompt_collision(JOBS_DIR, prompt_sha)
+        if collision:
+            raise RuntimeError(
+                "DUPLICATE_MAIN_PROMPT: identical prompt is already running "
+                f"as {collision.get('job_id')} in repo {collision.get('repo')}"
+            )
+
+        lease_token = CHECKOUT_LEASE_MANAGER.acquire(
+            repo=self.repo,
+            job_id=d.name,
+            job_dir=d,
+        )
+        previous_job, previous_job_dir = self.job, self.job_dir
+        try:
+            d.mkdir(parents=True)
+            (d / "original-prompt.md").write_text(prompt)
+            (d / "checkpoint.md").write_text("")
+
+            attachments = list(self.pending_attachments) if attachments is None else list(attachments)
+            try:
+                pskill = subprocess.run(
+                    [str(HOME / ".local/bin/orch-skills"), "select", "--text", prompt, "--limit", "2", "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env={
+                        **os.environ.copy(),
+                        "AI_ORCH_PROJECT_BASE": str(PROJECT_BASE),
+                        "AI_ORCH_REPO": str(self.repo),
+                    },
+                )
+                skills = json.loads(pskill.stdout) if pskill.returncode == 0 else []
+            except Exception:
+                skills = []
+
+            self.job_dir = d
+            self.job = {
+                "schema_version": 3,
+                "id": d.name,
+                "title": (prompt.splitlines()[0] if prompt else "task")[:100],
+                "repo": str(_canonical_repo(self.repo)),
+                "workspace_id": WORKSPACE_ID or os.getenv("AI_ORCH_WORKSPACE_ID"),
+                "project_base": str(PROJECT_BASE),
+                "branch_at_start": git_branch(self.repo),
+                "head_at_start": git_head(self.repo),
+                "created_at": iso(),
+                "updated_at": iso(),
+                "status": "PREPARING",
+                "resume_at": None,
+                "attempt": 0,
+                "task_status": None,
+                "scope_mode": scope_mode,
+                "permission_profile": self.permission_profile,
+                "max_delegates": max_delegates,
+                "prompt_sha256": prompt_sha,
+                "prompt_preview": prompt[:240],
+                "attachments": attachments,
+                "skills": skills,
+                "queue_entry_id": queue_entry_id,
+                "project_binding": binding,
+                "binding_sha256": binding_sha,
+                "checkout_lease_token": lease_token,
+            }
+            self.save()
+            self._initialize_durable_runtime(prompt)
+
+            journal = self._journal()
+            branch_intent = None
+            if journal and branch_plan:
+                branch_intent = journal.intent(
+                    "git.branch_plan",
+                    idempotency_key=f"{d.name}:branch-plan",
+                    plan=branch_plan,
+                )
+            try:
+                self._branch_apply_plan(branch_plan)
+            except Exception as exc:
+                if journal and branch_intent:
+                    journal.terminal(
+                        str(branch_intent["intent_id"]),
+                        "failed",
+                        error=repr(exc),
+                    )
+                raise
+            else:
+                if journal and branch_intent:
+                    journal.terminal(
+                        str(branch_intent["intent_id"]),
+                        "success",
+                        branch=git_branch(self.repo),
+                        head=git_head(self.repo),
+                    )
+
+            self.job["branch_at_start"] = git_branch(self.repo)
+            self.job["head_at_start"] = git_head(self.repo)
+            self.job["status"] = "READY"
+            self.save()
+
+            self.raw.clear()
+            self.attempts.clear()
+            self.current = None
+            self.delegate_states.clear()
+            self._mount_user_message(prompt)
+            self.start(False)
+            self.pending_attachments.clear()
+        except Exception:
+            CHECKOUT_LEASE_MANAGER.release(repo=self.repo, token=lease_token)
+            if self.job is not None and self.job_dir == d:
+                self.job["status"] = "BLOCKED"
+                self.job["task_status"] = "BLOCKED"
+                self.job["checkout_lease_token"] = None
+                self.save()
+            else:
+                self.job, self.job_dir = previous_job, previous_job_dir
+            raise
 
     def start(self, resume: bool) -> None:
         if not self.job or not self.job_dir:
